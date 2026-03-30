@@ -1,0 +1,39 @@
+project_name = "benchvec"
+seed = 42
+
+[paths]
+data_dir = ".data"
+benchmark_dir = ".benchmarks"
+cache_dir = ".cache"
+
+[dataset]
+primary = "cohere_wikipedia"
+fallback_enabled = true
+seed = 42
+sample_size = 180
+ground_truth_k = 50
+ground_truth_query_count = 40
+min_text_characters = 64
+chunk_size = 256
+chunk_overlap = 32
+local_embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
+cohere_dataset_name = "Cohere/wikipedia-22-12-simple-embeddings"
+cohere_dataset_config = "en"
+cohere_split = "train"
+simple_wikipedia_name = "wikipedia"
+simple_wikipedia_config = "20220301.simple"
+huggingface_token_env_var = "HF_TOKEN"
+
+[engines]
+enabled = ["faiss", "chromadb", "lancedb"]
+distance_metric = "l2"
+faiss_index_type = "flat"
+faiss_nlist = 64
+
+[workloads]
+repetitions = 10
+warmup_queries = 20
+k_values = [10]
+ingest_batch_sizes = [60]
+ingest_rates_per_second = [100]
+concurrent_workers = [1]

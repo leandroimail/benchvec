@@ -384,8 +384,3 @@ uv run python main.py inspect --run-id run-123 --type ingest
 - Cohere Wikipedia access still depends on the required Hugging Face permissions.
 - Root files `AGENTS.md`, `PRD03.md`, and `Resumo.md` are kept outside implementation commits unless explicitly requested.
 
-## Additional Documentation
-
-- PRD03 validation checklist and coverage status: `docs/VALIDACAO_PRD03.md`
-- Usage guide for setup, run, report, and inspect: `docs/COMO_USAR.md`
-- First benchmark execution report and result interpretation: `reports/benchmark_01_descricao.md`

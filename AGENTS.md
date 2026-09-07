@@ -27,15 +27,15 @@
 * Whenever possible, use logging to record events and errors.
 * Always use the `writing-tests` skill when building tests.
 * Always use the `creating-skills` skill whenever building or writing a skill for the project.
-* All project development must be done from the ./wife_core directory
+* All project development is done from the repository root (benchvec package lives in ./benchvec, tests in ./tests).
 
 # Run Scripts
 
 * Whenever possible, create CLI scripts to execute core functionality.
 * Whenever possible, run generated or modified scripts to ensure they work correctly.
-* Always run Python code via "uv run python <script>.py"
-* Always run tests via "uv run pytest <test_file>.py"
-* All scripts are created from the ./wife core folder and the path to the Python virtual environment is in ./.venv
+* Always run Python code via "uv run python <script>.py" from the repository root
+* Always run tests via "uv run pytest <test_file>.py" from the repository root
+* The Python virtual environment is in ./.venv (managed by uv)
 
 
   

@@ -1,6 +1,6 @@
 # BenchVec User Guide — Complete Reference
 
-> **BenchVec** is a Python benchmarking suite for comparing embedded vector databases (FAISS, ChromaDB, LanceDB) with reproducibility and scientific rigor.
+> **BenchVec** is a Python benchmarking suite for comparing embedded vector databases (FAISS, ChromaDB, LanceDB, sqlite-vec, TurboVec) with reproducibility and scientific rigor.
 
 ---
 
@@ -24,7 +24,7 @@
 ### 1. Install 
 
 ```bash
-cd ~/Desktop/SBBD
+cd benchvec
 uv venv --python 3.12 .venv
 uv sync --dev
 ```
@@ -33,7 +33,7 @@ uv sync --dev
 
 ```bash
 uv run pytest -q
-# Expected: 123 passed
+# Expected: 305 passed
 ```
 
 ### 3. First Benchmark 
@@ -66,9 +66,9 @@ uv run python main.py inspect --run-id $RUNID --summary
 
 ---
 
-## Main Benchmark (for SBBD Paper)
+## Main Benchmark
 
-Steps to execute the benchmark for SBBD 2026 submission.
+Steps to execute the complete benchmark campaign (all workloads, all engines).
 
 ### Prerequisites
 
@@ -82,14 +82,14 @@ export HF_TOKEN="hf_xxxxxxxxxxxxx"
 2. **Prepare environment** (if not done)
 ```bash
 uv sync --dev
-uv run pytest -q  # Validate: 123 passed
+uv run pytest -q  # Validate: 305 passed
 ```
 
 ### Step 1: Create Project
 
 ```bash
-uv run python main.py init --project sbbd-2026
-# Output: ✓ Project initialized: /path/to/.benchmarks/projects/sbbd-2026
+uv run python main.py init --project full-benchmark
+# Output: ✓ Project initialized: /path/to/.benchmarks/projects/full-benchmark
 ```
 
 ### Step 2: Execute Full Benchmark
@@ -100,34 +100,34 @@ uv run python main.py run-all --config configs/first-benchmark.toml
 
 **What will be tested:**
 - **Engines**: FAISS (IndexFlatL2), ChromaDB (HNSW), LanceDB (Lance)
-- **Dataset**: Cohere Wikipedia 22-12 (180 passages, 768 dimensions)
-- **Workloads**: A1-B4 (ingest, search, filtered, persistence, reopen, RAM pressure)
+- **Dataset**: Cohere Wikipedia 22-12 (180 passages, 1024 dimensions)
+- **Workloads**: A1-B4 (ingest, search, filtered, persistence, reopen, RAM pressure); C1 (concurrent search ladder); C2 (dataset scaling ladder); D1 (delete/upsert lifecycle); sweep (Recall-QPS parameter sweep); k-sweep in A2
 - **Repetitions**: 10 reps × 3 engines = 30 runs
 
 ### Step 3: Consolidate Results
 
 ```bash
 uv run python main.py report \
-  --input .benchmarks/projects/sbbd-2026/results \
-  --output .benchmarks/projects/sbbd-2026/reports/final.parquet
+  --input .benchmarks/projects/full-benchmark/results \
+  --output .benchmarks/projects/full-benchmark/reports/final.parquet
 ```
 
 Export to CSV (Excel compatible):
 
 ```bash
 uv run python main.py report \
-  --input .benchmarks/projects/sbbd-2026/results \
-  --output .benchmarks/projects/sbbd-2026/reports/final.csv
+  --input .benchmarks/projects/full-benchmark/results \
+  --output .benchmarks/projects/full-benchmark/reports/final.csv
 ```
 
 ### Step 4: Generate Charts
 
 ```bash
-uv run python main.py charts --project sbbd-2026
-# Output: Generated 6 charts in .benchmarks/projects/sbbd-2026/reports/charts/
+uv run python main.py charts --project full-benchmark
+# Output: Generated 10 charts in .benchmarks/projects/full-benchmark/reports/charts/
 ```
 
-**Output**: 6 PNGs in `.benchmarks/projects/sbbd-2026/reports/charts/`
+**Output**: 10 PNGs in `.benchmarks/projects/full-benchmark/reports/charts/`
 
 ### Step 5: Prepare Documentation
 
@@ -135,10 +135,10 @@ Record environment fingerprint for the paper:
 
 ```bash
 # View host fingerprint (CPU, RAM, storage, OS)
-cat .benchmarks/projects/sbbd-2026/results/faiss/a1/run-*/env.json | jq '.host_fingerprint'
+cat .benchmarks/projects/full-benchmark/results/faiss/a1/run-*/env.json | jq '.host_fingerprint'
 
 # View library versions
-cat .benchmarks/projects/sbbd-2026/results/**/env.json | jq '.library_versions'
+cat .benchmarks/projects/full-benchmark/results/**/env.json | jq '.library_versions'
 ```
 
 ---
@@ -159,7 +159,7 @@ cat .benchmarks/projects/sbbd-2026/results/**/env.json | jq '.library_versions'
 uv python install 3.12
 
 # Project folder
-cd /Users/leandro.ferreira/Desktop/SBBD
+cd benchvec
 uv venv --python 3.12 .venv
 
 # Dependencies (dev + production)
@@ -179,7 +179,7 @@ uv run mypy benchvec tests
 
 # Tests
 uv run pytest -q
-# Expected: 123 passed
+# Expected: 305 passed
 ```
 
 ### Step 3: Datasets (Optional)
@@ -235,7 +235,7 @@ Focus on realistic scenarios with persistence, structured filters, and metadata.
 
 #### Cohere Wikipedia 22-12 (Main - Recommended)
 - **Corpus:** Simple English Wikipedia with pre-computed embeddings
-- **Dimension:** 768 (model `embed-multilingual-v2.0`)
+- **Dimension:** 1024 (model `embed-multilingual-v2.0`)
 - **Size:** Up to 170,000 passages (use configurable sample_size)
 - **Prerequisite:** HuggingFace authentication (CLI login)
 - **Advantage:** Pre-computed embeddings = guaranteed reproducibility
@@ -268,7 +268,7 @@ All Group B datasets include metadata for filter testing:
 - **creation_date**: deterministic synthetic timestamps (2021-2025)
 - **document_length_bucket**: size ranges (short/medium/long/xlong)
 
-### Recommendation for SBBD Paper
+### Recommendation for Publications
 
 1. **For Benchmark A (Pure ANN):** Use **SIFT1M** (canonical dataset, won't be questioned)
 2. **For Benchmark B (Local RAG):** Use **Cohere Wikipedia**
@@ -311,13 +311,19 @@ A project is a directory that groups:
 │   └── index.parquet
 ├── reports/                  # Consolidated reports
 │   ├── final.parquet
-│   └── charts/               # 6 PNG charts
+│   ├── stats_summary.parquet
+│   ├── stats_pairwise.parquet
+│   └── charts/               # 10 PNG charts
 │       ├── chart_01_latency.png
 │       ├── chart_02_qps.png
 │       ├── chart_03_recall.png
 │       ├── chart_04_peak_ram.png
 │       ├── chart_05_disk_footprint.png
-│       └── chart_06_build_time.png
+│       ├── chart_06_build_time.png
+│       ├── chart_07_concurrency.png
+│       ├── chart_08_pareto.png
+│       ├── chart_09_scaling.png
+│       └── chart_10_k_sweep.png
 └── logs/                     # Execution logs
 ```
 
@@ -361,7 +367,7 @@ open .benchmarks/projects/my-benchmark/reports/charts/
 The project root and benchmark projects follow this hierarchy:
 
 ```
-SBBD/
+benchvec/
 ├── README.md                     # Main documentation (English)
 ├── README_pt-BR.md              # Main documentation (Portuguese)
 ├── LICENSE                       # MIT License
@@ -383,17 +389,21 @@ SBBD/
 │       ├── __init__.py
 │       ├── base.py              # Base engine class
 │       ├── faiss_engine.py      # FAISS adapter
-│       ├── chromadb_engine.py   # ChromaDB adapter
-│       └── lancedb_engine.py    # LanceDB adapter
+│       ├── chroma_engine.py   # ChromaDB adapter
+│       ├── lancedb_engine.py    # LanceDB adapter
+│       ├── sqlite_vec_engine.py # sqlite-vec adapter (brute force)
+│       └── turbovec_engine.py   # TurboVec adapter (TurboQuant, cosine-only)
 ├── configs/                     # Configuration templates
 │   └── first-benchmark.toml     # Official benchmark config
 ├── docs/
 │   ├── USER_GUIDE.md           # This file (English guide)
-│   └── COMO_USAR.md            # Portuguese guide
+│   ├── COMO_USAR.md            # Portuguese guide
+│   ├── TECHNICAL.md            # Complete technical reference (English)
+│   └── TECHNICAL_pt-BR.md      # Complete technical reference (Portuguese)
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py             # Pytest configuration
-│   └── unit/                    # 123 unit tests
+│   └── unit/                    # 305 unit tests
 │       ├── test_cli.py
 │       ├── test_config.py
 │       ├── test_datasets.py
@@ -417,13 +427,17 @@ SBBD/
 │       │   ├── reports/         # Consolidated reports
 │       │   │   ├── final.parquet
 │       │   │   ├── final.csv
-│       │   │   └── charts/      # 6 PNG comparison charts
+│       │   │   └── charts/      # 10 PNG comparison charts
 │       │   │       ├── chart_01_latency.png
 │       │   │       ├── chart_02_qps.png
 │       │   │       ├── chart_03_recall.png
 │       │   │       ├── chart_04_peak_ram.png
 │       │   │       ├── chart_05_disk_footprint.png
-│       │   │       └── chart_06_build_time.png
+│       │   │       ├── chart_06_build_time.png
+│       │   │       ├── chart_07_concurrency.png
+│       │   │       ├── chart_08_pareto.png
+│       │   │       ├── chart_09_scaling.png
+│       │   │       └── chart_10_k_sweep.png
 │       │   └── logs/            # Execution logs
 │       └── my-project/          # Custom project
 │           └── [same structure]
@@ -477,9 +491,11 @@ ingest_batch_sizes = [60]
 | **[dataset]** | `primary` | enum | cohere_wikipedia | Dataset: cohere_wikipedia, simple_wikipedia, sift1m, gist1m |
 | | `sample_size` | int | 100_000 | Number of vectors |
 | | `ground_truth_k` | int | 100 | K for ground-truth |
-| **[engines]** | `enabled` | list | [faiss, chromadb, lancedb] | Engines to test |
-| | `distance_metric` | enum | l2 | Metric: l2 or cosine |
+| **[engines]** | `enabled` | list | [faiss, chromadb, lancedb] | Engines: faiss, chromadb, lancedb, sqlite_vec, turbovec |
+| | `distance_metric` | enum | l2 | Metric: l2 or cosine (turbovec requires cosine — its kernel is inner-product-only; enabling turbovec under l2 fails at config load) |
 | | `faiss_index_type` | enum | flat | FAISS: flat or ivfflat |
+| **[engines.turbovec]** | `bit_width` | 2\|3\|4 | 4 | TurboQuant bit width (build-time; sweep via `turbovec_bit_width`) |
+| | `calibrate` | bool | false | TQ+ calibration (~1024-row sample) at build time |
 | **[workloads]** | `repetitions` | int | 10 | Reps per engine |
 | | `k_values` | list | [10] | K values for recall@K |
 | | `ingest_batch_sizes` | list | [1000] | Batch sizes |
@@ -543,12 +559,12 @@ uv run python main.py run \
 
 ## Generating Charts
 
-After running a benchmark, automatically generate 6 comparison PNG charts.
+After running a benchmark, automatically generate 10 comparison PNG charts.
 
 ### Basic Command
 
 ```bash
-# Generate all 6 charts
+# Generate all charts
 uv run python main.py charts --project my-benchmark
 ```
 
@@ -563,6 +579,10 @@ chart_03_recall.png             # Recall@K by engine (target: 1.0)
 chart_04_peak_ram.png           # Peak RAM (MB) by workload
 chart_05_disk_footprint.png     # Aggregated disk footprint
 chart_06_build_time.png         # Build time + time-to-serve
+chart_07_concurrency.png        # QPS per thread level (C1 ladder)
+chart_08_pareto.png             # Recall vs QPS frontier per sweep point
+chart_09_scaling.png            # Latency/throughput per dataset size (C2)
+chart_10_k_sweep.png            # Recall@K per k value (A2 k-sweep)
 ```
 
 **Total size:** ~240-250 KB (40-50 KB each)
@@ -614,6 +634,30 @@ uv run python main.py charts \
 - **Phases:** Build time (blue) vs Time-to-serve (orange)
 - **Expected:** FAISS ~0.0-0.01s, ChromaDB ~0.02-0.05s
 
+#### Chart 7: Concurrency (C1)
+- **Y-axis:** QPS per concurrency level
+- **Reading:** linear scaling means the engine uses threads natively; a
+  flat line means the client serializes queries
+- **Alert:** `status=partial` levels indicate a locked-retry fallback
+  (the engine is not thread-safe)
+
+#### Chart 8: Pareto Frontier (Sweep)
+- **Axes:** QPS (log) vs mean Recall@K, one line per engine
+- **Reading:** each point is one search-parameter grid value (e.g.
+  FAISS `nprobe`, LanceDB `nprobes`/`refine_factor`, TurboVec bit width)
+- **Expected:** the upper-left frontier dominates; dominated points are
+  drawn dimmer
+
+#### Chart 9: Scaling (C2)
+- **Y-axis:** Mean latency and ingest throughput per dataset size
+- **Reading:** super-linear latency growth signals memory pressure or
+  cache exhaustion at larger sizes
+
+#### Chart 10: k-Sweep (A2)
+- **Y-axis:** Recall@K for each configured `k_values` entry
+- **Expected:** recall decays slowly as k grows; sharp drops indicate
+  index quality limits (e.g. aggressive IVF pruning)
+
 ### Export for Presentation
 
 ```bash
@@ -626,107 +670,45 @@ cp .benchmarks/projects/my-benchmark/reports/charts/*.png ~/presentation/
 
 ---
 
-## Quick Analysis Generator (90 Records)
+## Quick Analysis
 
-For rapid validation of the analysis pipeline and benchmarking workflow:
+Generate a structured analysis report from consolidated benchmark
+summaries (Markdown, HTML or JSON):
 
 ### Basic Usage
 
 ```bash
-# Generate detailed markdown report (default)
-uv run python test_cohere_90.py
-# Output: report.markdown (~1KB, ~25 lines)
+# Detailed markdown report (default)
+uv run python main.py analyze --project my-benchmark --output report.md
 ```
 
 ### Output Formats
 
-Generate analysis in different formats:
-
 ```bash
-# Markdown format (readable, suitable for documentation)
-uv run python test_cohere_90.py --format markdown
+# JSON for programmatic processing
+uv run python main.py analyze --project my-benchmark --format json --output analysis.json
 
-# JSON format (structured data for programmatic processing)
-uv run python test_cohere_90.py --format json --output analysis.json
-
-# HTML format (self-contained, browser-viewable)
-uv run python test_cohere_90.py --format html --output report.html
+# Self-contained HTML, browser-viewable
+uv run python main.py analyze --project my-benchmark --format html --output report.html
 ```
 
 ### Report Types
 
-Select the level of detail in the report:
-
 ```bash
-# Executive summary (high-level overview for presentations)
-uv run python test_cohere_90.py --report-type executive_summary
+# High-level overview for presentations
+uv run python main.py analyze --project my-benchmark --report-type executive_summary --output summary.md
 
-# Detailed (full analysis with comprehensive tables)
-uv run python test_cohere_90.py --report-type detailed
+# Full analysis with comprehensive tables (default)
+uv run python main.py analyze --project my-benchmark --report-type detailed --output detailed.md
 
-# Statistical only (metrics and statistics only)
-uv run python test_cohere_90.py --report-type statistical_only
+# Metrics and statistics only
+uv run python main.py analyze --project my-benchmark --report-type statistical_only --output stats.md
 ```
 
-### Combined Examples
-
-```bash
-# Executive summary in JSON for automated processing
-uv run python test_cohere_90.py \
-  --report-type executive_summary \
-  --format json \
-  --output summary.json
-
-# Detailed HTML report for stakeholder presentation
-uv run python test_cohere_90.py \
-  --report-type detailed \
-  --format html \
-  --output presentation_report.html
-
-# Statistical analysis in markdown for documentation
-uv run python test_cohere_90.py \
-  --report-type statistical_only \
-  --format markdown \
-  --output stats.md
-```
-
-### Data Characteristics
-
-The 90-record generator creates realistic synthetic Cohere data:
-
-- **Total records:** 90
-- **Engines:** Balanced distribution of FAISS, ChromaDB, LanceDB
-- **Workloads:** All workload types (A1-A2, B1-B4) included
-- **Metrics statistics:**
-  - Mean latency: ~20.7ms
-  - QPS (throughput): ~91 queries/second
-  - Recall@K: ~0.9165 (91.65%)
-  - Peak RAM: ~190-200MB
-- **Execution time:** < 1 second
-- **Report sizes:**
-  - Markdown: ~1KB
-  - JSON: ~1.1KB
-  - HTML: ~1KB
-
-### Use Cases
-
-1. **Development & Testing** — Validate analysis pipeline during development
-2. **CI/CD Pipelines** — Fast automated testing (< 1 second)
-3. **Demonstrations** — Show functionality without long computation times
-4. **Documentation** — Generate example outputs for user guides
-5. **Prototyping** — Quickly test new analysis features
-
-### Integration with Full Benchmarks
-
-The 90-record format is compatible with the full benchmark results:
-
-```bash
-# After running main.py run-all, generate quick analysis
-uv run python main.py analyze --project benchmark_default --format markdown
-
-# Or keep using the 90-record generator for quick iterations
-uv run python test_cohere_90.py --report-type detailed --format html
-```
+The analysis renders the significance table from
+`stats_pairwise.parquet` (run `report --stats` first, default on) and a
+workload-by-workload summary. See [TECHNICAL.md](TECHNICAL.md) §6–§7 for
+methodology.
 
 ---
 
@@ -838,7 +820,7 @@ uv run python main.py init --project my-project
 | **B1** | Search with structured filters | Filtered latency | tag=X: 1.2ms (ChromaDB) |
 | **B2** | Continuous ingest | Latency degradation | Queries during inserts |
 | **B3** | Persistence/reopen | Restart time | Index reopened in 100ms |
-| **B4** | Memory pressure | Overflow behavior | Disk-bound queries |
+| **B4** | Reopen persisted state | Reopen + search correctness | Disk-bound queries |
 
 ---
 
@@ -895,3 +877,46 @@ uv run python main.py run-all --config configs/first-benchmark.toml
 - **Technical specification:** `benchvec/` (modules) and `tests/unit/` (tests)
 - **Portuguese guide:** See [COMO_USAR.md](./COMO_USAR.md)
 - **Main README:** See [../README.md](../README.md)
+
+
+---
+
+## Expansion Workloads (C1, C2, D1, Sweep)
+
+### C1 — Concurrent Search
+Executes the query set under a thread ladder (`concurrent_workers = [1, 2, 4, 8]`),
+reporting QPS and p95 latency per level. Use it to size RAG services for
+multiple users:
+
+```bash
+uv run python main.py run --project my-benchmark --workload c1
+```
+
+### C2 — Dataset Scaling Ladder
+Ingests and measures nested dataset prefixes (`sample_sizes = [500, 1000, 2000, 3000]`),
+revealing how each engine scales. Prefixes come from one deterministic ordering,
+so per-size deltas are comparable.
+
+### D1 — Delete & Upsert Lifecycle
+Deletes a deterministic 10% of records, validates post-delete recall, then
+upserts live-record overwrites plus a slice of resurrections. Surfaces the
+delete-time vs storage-reclaim trade-off (FAISS tombstones vs native deletes).
+
+### Sweep — Recall-QPS Pareto Frontier
+Sweeps search parameters (FAISS `nprobe`, LanceDB `nprobes` × `refine_factor`)
+and records (params, latency, recall) per query. Powers `chart_08_pareto.png`.
+ChromaDB is excluded by default because its HNSW `ef` is fixed at collection
+creation; enable `[engines.chroma] ef_search_grid_enabled` to opt in (each
+grid point rebuilds the collection). TurboVec sweeps
+`[workloads.param_sweep] turbovec_bit_width` the same way (each width
+rebuilds the quantized index; the sweep runs at `k_values[0]`).
+
+### Statistics
+`report --stats` (default on) writes `stats_summary.parquet` (bootstrap CIs,
+CV) and `stats_pairwise.parquet` (pairwise Mann-Whitney U with Holm step-down
+correction within each workload family). The markdown analysis includes a
+significance table when the pairwise parquet exists.
+
+### Disk hygiene
+Engine storage is deleted after each run's metrics are captured. Pass
+`--keep-engine-storage` to `run`/`run-all` to retain it for inspection.

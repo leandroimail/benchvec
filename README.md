@@ -1,11 +1,11 @@
 # BenchVec: Reproducible Vector Database Benchmarking Suite
 
 [![Status](https://img.shields.io/badge/status-stable-brightgreen)](https://github.com)
-[![Tests](https://img.shields.io/badge/tests-123%20passed-blue)](https://github.com)
+[![Tests](https://img.shields.io/badge/tests-305%20passed-blue)](https://github.com)
 [![Python](https://img.shields.io/badge/python-3.10+-3776ab)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-green)](https://opensource.org/licenses/MIT)
 
-BenchVec is a Python benchmarking suite for **fair and reproducible comparison** of embedded vector databases (FAISS, ChromaDB, LanceDB) with rigorous scientific methodology.
+BenchVec is a Python benchmarking suite for **fair and reproducible comparison** of embedded vector databases (FAISS, ChromaDB, LanceDB, sqlite-vec, TurboVec) with rigorous scientific methodology.
 
 **[Português](#português-readme) | [Documentation](#documentation) | [Quick Start](#quick-start)**
 
@@ -39,7 +39,7 @@ BenchVec provides:
   - Environment capture (OS, Python version, library versions)
 
 ✅ **Automated reporting:**
-  - 6 professional comparison charts (PNG)
+  - 10 professional comparison charts (PNG)
   - Parquet/CSV exports for analysis
   - Per-run inspection via CLI
   - Consolidation across multiple runs
@@ -56,14 +56,17 @@ BenchVec provides:
 
 | Feature | Benefit |
 |---------|---------|
-| **Complete workload coverage** | A1-B4: ingestion, pure search, filtered search, persistence, memory pressure |
+| **Complete workload coverage** | A1-B4: ingestion, pure search, filtered search, persistence, memory pressure; C1: concurrent search (thread ladder); C2: dataset scaling ladder; D1: delete/upsert lifecycle; Sweep: Recall-QPS parameter sweep |
 | **Official datasets** | SIFT1M, GIST1M, Cohere Wikipedia 22-12 with pre-computed embeddings |
 | **Metadata-aware** | Synthetic but deterministic metadata for realistic RAG scenarios |
 | **Timeout policies** | Configurable per-phase timeouts with partial result capture |
-| **Multi-engine** | FAISS, ChromaDB, LanceDB with pluggable architecture |
-| **Concurrent testing** | Optional multi-threaded query execution |
+| **Multi-engine** | FAISS, ChromaDB, LanceDB, sqlite-vec (brute force), TurboVec (TurboQuant quantization) with pluggable architecture |
+| **ANN indexes everywhere** | FAISS IVFFlat (nprobe), ChromaDB HNSW (ef_search), LanceDB IVF_PQ, TurboVec TurboQuant (2/3/4-bit sweep) — no hidden scan-only comparisons |
+| **Concurrent testing** | C1 measures QPS and latency under 1-8 threads |
+| **Statistical rigor** | Bootstrap CIs, CV across repetitions, pairwise Mann-Whitney with Holm correction |
 | **Project organization** | Isolated benchmarks with structured directory layouts |
-| **Visual reports** | 6 automatic comparison charts (latency, QPS, recall, RAM, disk, build time) |
+| **Visual reports** | 10 automatic comparison charts (latency, QPS, recall, RAM, disk, build time, concurrency, Pareto frontier, scaling, k-sweep) |
+| **Disk hygiene** | Engine storage cleaned after metrics are captured (`--keep-engine-storage` to retain) |
 
 ---
 
@@ -72,15 +75,15 @@ BenchVec provides:
 ### Installation
 
 ```bash
-git clone https://github.com/leandro-ferreira/SBBD.git
-cd SBBD
+git clone git@github.com:leandroimail/benchvec.git
+cd benchvec
 
 # Python 3.10+ with uv
 uv sync --dev
 
 # Validate
 uv run pytest -q
-# Expected: 123 passed
+# Expected: 305 passed
 ```
 
 ### First Benchmark
@@ -114,39 +117,32 @@ uv run python main.py run-all --project fast-test
 
 | Parameter | Full Profile | Fast Test |
 |-----------|-------------|-----------|
-| sample_size | 100,000 | **5,000** |
-| ingest_batch_sizes | [1K, 10K, 100K] | **[1K]** |
+| sample_size | 180 | **5,000** |
+| ingest_batch_sizes | [60] | **[1,000]** |
 | repetitions | 10 | **3** |
-| warmup_queries | 100 | **10** |
-| Target time | Hours | **<5 min** |
+| warmup_queries | 20 | **10** |
+| Target time | Minutes | **<5 min** |
 
-### Quick Analysis Generator (90 Records)
+### Impact Profile (Full Campaign)
 
-For rapid testing and validation of the analysis pipeline:
+All expansion workloads — concurrency (C1), scaling (C2), delete/upsert (D1),
+parameter sweep, k-sweep — with ANN indexes on every engine:
 
 ```bash
-# Generate detailed markdown report with 90 synthetic records
-uv run python test_cohere_90.py
-# Output: report.markdown (~1KB) with complete analysis
-
-# Generate JSON analysis for programmatic processing
-uv run python test_cohere_90.py --format json --output analysis.json
-
-# Generate HTML report with interactive statistics
-uv run python test_cohere_90.py --format html --output report.html
-
-# All report types (executive summary, detailed, statistical only)
-uv run python test_cohere_90.py --report-type detailed --format markdown
-uv run python test_cohere_90.py --report-type executive_summary --format json
-uv run python test_cohere_90.py --report-type statistical_only --format html
+uv run python main.py init --project impact --template configs/impact-benchmark.toml
+uv run python main.py run-all --project impact
+uv run python main.py report --project impact --output .benchmarks/projects/impact/reports/final.parquet
+uv run python main.py charts --project impact
+uv run python main.py analyze --project impact --output .benchmarks/projects/impact/reports/analysis.md
 ```
 
-**Features:**
-- 90 synthetic Cohere records (balanced across engines: FAISS, ChromaDB, LanceDB)
-- Execution time: < 1 second (ideal for testing)
-- Realistic metrics: latency ~20ms, QPS ~90, recall ~0.91
-- Multiple output formats: Markdown, JSON, HTML
-- Complete performance analysis in compact form
+Measured on a MacBook M5 (16 GB) with the 5-engine cosine campaign
+(faiss, chromadb, lancedb, sqlite_vec, turbovec): 233 summaries, all
+`success`, ~8.8 min of workload wall time (clean run), 9.4 MB on disk
+with default engine-storage cleanup. The TurboVec bit-width sweep spreads recall@10
+across 0.899 / 0.956 / 0.973 at 2/3/4 bits. See
+`configs/impact-benchmark.toml` for the measured budget and the
+[Technical Reference](docs/TECHNICAL.md) for the design rationale.
 
 ### Generate Analysis Reports
 
@@ -177,10 +173,22 @@ open .benchmarks/projects/benchmark_default/reports/charts/
 - `chart_04_peak_ram.png` — Peak memory usage
 - `chart_05_disk_footprint.png` — Disk storage per engine
 - `chart_06_build_time.png` — Index build + time-to-serve
+- `chart_07_concurrency.png` — QPS + p95 latency vs thread count (C1)
+- `chart_08_pareto.png` — Recall vs QPS frontier per search-params point (Sweep)
+- `chart_09_scaling.png` — Latency + ingest throughput vs dataset size (C2)
+- `chart_10_k_sweep.png` — Recall and latency vs k (A2 k-sweep)
 
 ---
 
 ## Documentation
+
+### Complete Reference
+
+- **[TECHNICAL.md](docs/TECHNICAL.md)** — Full technical reference (English)
+  - Engine capability matrix (faiss, chromadb, lancedb, sqlite_vec, turbovec)
+  - All 10 workloads and the exact ground-truth protocol
+  - Configuration schema, parameter sweeps, statistics, charts
+  - Validated campaign results and design decisions/limitations
 
 ### For Users
 
@@ -197,9 +205,10 @@ open .benchmarks/projects/benchmark_default/reports/charts/
   - Explicação dos workloads
   - Troubleshooting
 
-### For Researchers / SBBD Submission
+### For Researchers
 
-- **Run full benchmark** → see [Main Benchmark](docs/USER_GUIDE.md#main-benchmark-for-sbbd-paper) (English) or [Benchmark Principal](docs/COMO_USAR.md#benchmark-principal) (português)
+- **Complete technical reference** → see [Technical Reference](docs/TECHNICAL.md) (English) or [Referência Técnica](docs/TECHNICAL_pt-BR.md) (português)
+- **Run full benchmark** → see [Main Benchmark](docs/USER_GUIDE.md#main-benchmark) (English) or [Benchmark Principal](docs/COMO_USAR.md#benchmark-principal) (português)
 - **Official datasets** → see [Official Datasets](docs/USER_GUIDE.md#official-datasets) (English) or [Datasets Oficiais](docs/COMO_USAR.md#datasets-oficiais) (português)
 - **Workload definitions** → see [Workloads](docs/USER_GUIDE.md#workloads) section in USER_GUIDE.md
 - **Interpretation guide** → see [Generating Charts](docs/USER_GUIDE.md#generating-charts) (English) or [Gerando Gráficos](docs/COMO_USAR.md#gerando-gráficos) (português)
@@ -209,7 +218,7 @@ open .benchmarks/projects/benchmark_default/reports/charts/
 ## Project Structure
 
 ```
-SBBD/
+benchvec/
 ├── README.md                     # This file (English)
 ├── README_pt-BR.md              # Portuguese README
 ├── benchvec/                    # Main package
@@ -223,21 +232,26 @@ SBBD/
 │   ├── raw_store.py             # Micro-data storage
 │   ├── report.py                # Reports & charts
 │   ├── host.py                  # Hardware fingerprinting
+│   ├── statistics.py            # Bootstrap CI, Mann-Whitney U + Holm, CV
 │   ├── project.py               # Project management
 │   └── engines/                 # Engine adapters
 │       ├── base.py
 │       ├── faiss_engine.py
-│       ├── chromadb_engine.py
-│       └── lancedb_engine.py
+│       ├── chroma_engine.py
+│       ├── lancedb_engine.py
+│       ├── sqlite_vec_engine.py # sqlite-vec baseline (brute force)
+│       └── turbovec_engine.py   # TurboVec quantized index (cosine-only)
 ├── configs/                     # Example configurations
 │   ├── first-benchmark.toml     # Official benchmark
-│   └── fast-benchmark.toml      # Fast test profile (<5 min)
-│   └── fast-benchmark.toml      # Fast test profile (<5 min)
+│   ├── fast-benchmark.toml      # Fast test profile (<5 min)
+│   └── impact-benchmark.toml    # Full expansion profile (C1/C2/D1/sweep)
 ├── docs/
-│   ├── COMO_USAR.md            # Guide (Portuguese)
-│   └── README_pt-BR.md          # README (Portuguese)
+│   ├── USER_GUIDE.md           # Step-by-step user guide (English)
+│   ├── TECHNICAL.md            # Complete technical reference (English)
+│   ├── TECHNICAL_pt-BR.md      # Complete technical reference (Portuguese)
+│   └── COMO_USAR.md            # User guide (Portuguese)
 ├── tests/
-│   ├── unit/                    # 123 unit tests
+│   ├── unit/                    # 305 unit tests
 │   └── conftest.py
 └── .benchmarks/                 # Results (auto-created)
 ```
@@ -258,8 +272,8 @@ SBBD/
 
 ```bash
 # Clone repository
-git clone https://github.com/leandro-ferreira/SBBD.git
-cd SBBD
+git clone git@github.com:leandroimail/benchvec.git
+cd benchvec
 
 # Create environment
 uv venv --python 3.12 .venv
@@ -269,7 +283,7 @@ uv sync --dev
 
 # Validate
 uv run pytest -q
-# Expected: 123 passed ✅
+# Expected: 305 passed ✅
 ```
 
 ### Authenticate HuggingFace
@@ -296,14 +310,14 @@ Contributions welcome! Areas:
 
 ## Citation
 
-If you use BenchVec in your research, please cite:
+If you use BenchVec in your research, please cite the project:
 
 ```bibtex
-@inproceedings{benchvec2026,
+@misc{benchvec2026,
   title={BenchVec: Reproducible Vector Database Benchmarking},
   author={Ferreira, Leandro and Contributors},
-  booktitle={Brazilian Symposium on Database Systems (SBBD)},
-  year={2026}
+  year={2026},
+  howpublished={\url{https://github.com/leandroimail/benchvec}}
 }
 ```
 
@@ -324,8 +338,8 @@ Este projeto também está documentado em português:
 
 ---
 
-**Last Updated:** March 29, 2026  
-**Status:** ✅ Stable — Ready for SBBD 2026 submission
+**Last Updated:** September 7, 2026  
+**Status:** ✅ Stable
 
 ```bash
 uv run python main.py run --config config.toml --workload a2 --workload b1
@@ -342,11 +356,17 @@ The current implementation includes:
 - prepared dataset caching for Cohere Wikipedia and Simple Wikipedia fallback
 - deterministic synthetic metadata generation and chunking
 - exact ground-truth computation and caching
-- engine adapters for FAISS, ChromaDB, and LanceDB
-- workload runner methods for A1, A2, B1, B2, B3, and B4
+- engine adapters for FAISS (flat/IVFFlat), ChromaDB (HNSW), LanceDB (IVF_PQ), sqlite-vec (brute force), and TurboVec (TurboQuant exhaustive scan; cosine only, 2/3/4-bit widths, optional TQ+ calibration)
+- workload runner methods for A1-A2, B1-B4, plus C1 (concurrent search), C2 (dataset scaling ladder), D1 (delete/upsert lifecycle), and the Recall-QPS parameter sweep
+- search-parameter control per engine: FAISS `nprobe`, LanceDB `nprobes`/`refine_factor` (IVF_PQ index built automatically), ChromaDB `ef_search`, TurboVec `bit_width` (rebuild per grid point)
+- metric-aware exact ground truth: ground truth honors `engines.distance_metric` (turbovec requires `cosine`, its kernel is inner-product-only; the fail-fast config validator rejects turbovec + l2 at load time)
+- k-sweep: ground truth computed once at max k and sliced per k
+- statistics module: bootstrap CIs, cross-repetition CV, pairwise Mann-Whitney U with Holm step-down correction (`stats_summary.parquet` / `stats_pairwise.parquet`)
+- 10 comparative charts including the Recall-QPS Pareto frontier and concurrency scaling
 - summary persistence, raw micro-data persistence, run inspection, and report consolidation
 - **project-based artifact organization with automatic directory structure**
-- CLI commands for `init`, `run`, `run-all`, `report`, `inspect`, and `charts` with optional `--project` flag
+- disk hygiene: per-run engine storage is cleaned after metrics are captured (`--keep-engine-storage` to retain)
+- CLI commands for `init`, `run`, `run-all`, `report --stats`, `inspect`, `charts`, and `analyze` with optional `--project` flag
 
 ## CLI Usage
 
@@ -382,5 +402,5 @@ uv run python main.py inspect --run-id run-123 --type ingest
 - The benchmark artifacts are written under `.benchmarks/projects/{project_name}/` when using project mode, or `.benchmarks/results` in legacy mode.
 - The prepared dataset cache is written under `.cache/<dataset-name>`.
 - Cohere Wikipedia access still depends on the required Hugging Face permissions.
-- Root files `AGENTS.md`, `PRD03.md`, and `Resumo.md` are kept outside implementation commits unless explicitly requested.
+- Root files `AGENTS.md` and `main.py` are kept outside implementation commits unless explicitly requested.
 

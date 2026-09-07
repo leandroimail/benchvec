@@ -30,7 +30,18 @@ logger = logging.getLogger(__name__)
 
 app = click.Group(help="BenchVec reproducible benchmark CLI")
 console = Console()
-DEFAULT_WORKLOADS = ["a1", "a2", "b1", "b2", "b3", "b4"]
+DEFAULT_WORKLOADS = [
+    "a1",
+    "a2",
+    "b1",
+    "b2",
+    "b3",
+    "b4",
+    "c1",
+    "c2",
+    "d1",
+    "sweep",
+]
 
 
 def _validate_project_name(name: str) -> bool:
@@ -127,6 +138,7 @@ def _execute_run(
     workloads: tuple[str, ...],
     output_dir: Path | None,
     project: Project | None = None,
+    keep_engine_storage: bool = False,
 ) -> None:
     """Execute benchmark run with specified config and workloads.
 
@@ -135,17 +147,35 @@ def _execute_run(
         workloads: Tuple of workload names
         output_dir: Optional output directory override
         project: Optional Project instance for organizing results
+        keep_engine_storage: Keep per-run engine storage dirs (default: clean)
     """
     config = load_config(config_path)
     if output_dir is not None:
         config.paths.benchmark_dir = output_dir
     cache_dir = config.paths.cache_dir / config.dataset.primary
     _, records = prepare_dataset_from_config(config.dataset, cache_dir)
-    runner = BenchmarkRunner(config, project=project)
+    runner = BenchmarkRunner(config, project=project, clean_engine_storage=not keep_engine_storage)
     selected_workloads = list(workloads) or DEFAULT_WORKLOADS
     queries = _default_queries(runner, records)
     filter_scenarios = runner.build_filter_scenarios(records)
     selected_filter = filter_scenarios[0].filters if filter_scenarios else None
+    sorted_k_values = sorted(set(config.workloads.k_values))
+    # k-sweep: ground truth is computed once at the largest k and sliced per
+    # k (rows are rank-ordered, so the prefix is the exact k-NN answer).
+    a2_ground_truth: dict[str, list[str]] | None = None
+    if "a2" in selected_workloads and len(sorted_k_values) > 1:
+        max_k = max(sorted_k_values[-1], 1)
+        if max_k > len(records):
+            console.print(
+                f"[yellow]k={max_k} exceeds dataset size {len(records)}; clamping k_values[/yellow]"
+            )
+            sorted_k_values = [k_value for k_value in sorted_k_values if k_value <= len(records)]
+        if sorted_k_values:
+            a2_ground_truth = runner.ground_truth_for_queries(
+                records,
+                queries,
+                k=sorted_k_values[-1],
+            )
     summaries: list[BenchmarkSummary] = []
 
     for repetition_index in range(config.workloads.repetitions):
@@ -160,15 +190,22 @@ def _execute_run(
                     )
                 )
             if "a2" in selected_workloads:
-                summaries.append(
-                    runner.run_workload_a2(
-                        engine_name,
-                        records,
-                        query_records=queries,
-                        k=config.workloads.k_values[0],
-                        repetition_index=repetition_index,
+                for k_value in sorted_k_values:
+                    sliced_ground_truth = (
+                        {qid: ids[:k_value] for qid, ids in a2_ground_truth.items()}
+                        if a2_ground_truth is not None
+                        else None
                     )
-                )
+                    summaries.append(
+                        runner.run_workload_a2(
+                            engine_name,
+                            records,
+                            query_records=queries,
+                            k=k_value,
+                            ground_truth=sliced_ground_truth,
+                            repetition_index=repetition_index,
+                        )
+                    )
             if "b1" in selected_workloads and selected_filter is not None:
                 summaries.append(
                     runner.run_workload_b1(
@@ -212,9 +249,88 @@ def _execute_run(
                         repetition_index=repetition_index,
                     )
                 )
+            if "d1" in selected_workloads:
+                summaries.append(
+                    runner.run_workload_d1(
+                        engine_name,
+                        records,
+                        query_records=queries,
+                        k=config.workloads.k_values[0],
+                        repetition_index=repetition_index,
+                    )
+                )
+            if "c1" in selected_workloads:
+                summaries.extend(
+                    runner.run_workload_c1(
+                        engine_name,
+                        records,
+                        query_records=queries,
+                        k=config.workloads.k_values[0],
+                        thread_counts=config.workloads.concurrent_workers,
+                        repetition_index=repetition_index,
+                    )
+                )
 
+    # The scaling ladder and the sweep run once per engine after the
+    # repetition loop: sizes/grid points are repetition-insensitive and each
+    # already aggregates the full query set.
+    if "c2" in selected_workloads:
+        ladder_sizes = sorted(set(config.workloads.sample_sizes))
+        if ladder_sizes:
+            for engine_name in config.engines.enabled:
+                summaries.extend(
+                    runner.run_scaling_ladder(
+                        engine_name,
+                        records,
+                        query_records=queries,
+                        k=config.workloads.k_values[0],
+                        sample_sizes=ladder_sizes,
+                        batch_size=config.workloads.ingest_batch_sizes[0],
+                        max_c2_queries=config.workloads.max_c2_queries,
+                    )
+                )
+
+    if "sweep" in selected_workloads:
+        sweep_config = config.workloads.param_sweep
+        for engine_name in config.engines.enabled:
+            if engine_name == "faiss":
+                grid: dict[str, list[int]] = {"nprobe": list(sweep_config.faiss_nprobe)}
+            elif engine_name == "lancedb":
+                grid = {
+                    "nprobes": list(sweep_config.lancedb_nprobes),
+                    "refine_factor": list(sweep_config.lancedb_refine_factor),
+                }
+            elif engine_name == "chromadb" and config.engines.chroma.ef_search_grid_enabled:
+                grid = {"ef": list(config.engines.chroma.ef_search_grid)}
+            elif engine_name == "turbovec" and sweep_config.turbovec_bit_width:
+                grid = {"bit_width": list(sweep_config.turbovec_bit_width)}
+            else:
+                grid = {}
+            sweep_summary = runner.run_param_sweep(
+                engine_name,
+                records,
+                query_records=queries,
+                k=config.workloads.k_values[0],
+                grid=grid,
+                max_points=sweep_config.max_points,
+            )
+            if sweep_summary is not None:
+                summaries.append(sweep_summary)
+
+    # Post-invocation C1 storage cleanup: after every C1 workload has
+    # finished, no engine client references shared/c1 anymore, so removing
+    # it is safe here (inside the runner it would delete storage under a
+    # live chromadb client cache across repetitions).
+    c1_ran = "c1" in selected_workloads
     for summary in summaries:
         _print_summary_row(summary)
+    if c1_ran:
+        import shutil
+
+        shared_root = config.paths.benchmark_dir / "shared" / "c1"
+        if shared_root.exists():
+            shutil.rmtree(shared_root, ignore_errors=True)
+            console.print(f"[dim]cleaned shared C1 engine storage: {shared_root}[/dim]")
 
 
 @app.command("init")
@@ -282,11 +398,18 @@ def init_command(project_name: str, template: str) -> None:
 )
 @click.option("--workload", "workloads", multiple=True, help="Workload to run (multiple allowed).")
 @click.option("--output-dir", type=click.Path(path_type=Path), default=None, help="Override output directory.")
+@click.option(
+    "--keep-engine-storage",
+    is_flag=True,
+    default=False,
+    help="Keep per-run engine storage directories (default: delete after metrics are captured).",
+)
 def run_command(
     config_path: Path | None,
     project_name: str | None,
     workloads: tuple[str, ...],
     output_dir: Path | None,
+    keep_engine_storage: bool,
 ) -> None:
     """Run the selected workloads for the enabled engines.
 
@@ -305,7 +428,7 @@ def run_command(
     console.print(f"[dim]Project: {project.base_path}[/dim]")
     console.print(f"[dim]Config: {config_path}[/dim]")
 
-    _execute_run(config_path, workloads, output_dir, project=project)
+    _execute_run(config_path, workloads, output_dir, project=project, keep_engine_storage=keep_engine_storage)
 
 
 @app.command("run-all")
@@ -324,10 +447,17 @@ def run_command(
     help="Project name for organizing results. Defaults to 'benchmark_default'.",
 )
 @click.option("--output-dir", type=click.Path(path_type=Path), default=None, help="Override output directory.")
+@click.option(
+    "--keep-engine-storage",
+    is_flag=True,
+    default=False,
+    help="Keep per-run engine storage directories (default: delete after metrics are captured).",
+)
 def run_all_command(
     config_path: Path | None,
     project_name: str | None,
     output_dir: Path | None,
+    keep_engine_storage: bool,
 ) -> None:
     """Run the default full workload suite.
 
@@ -345,7 +475,7 @@ def run_all_command(
     console.print(f"[dim]Project: {project.base_path}[/dim]")
     console.print(f"[dim]Config: {config_path}[/dim]")
 
-    _execute_run(config_path, tuple(DEFAULT_WORKLOADS), output_dir, project=project)
+    _execute_run(config_path, tuple(DEFAULT_WORKLOADS), output_dir, project=project, keep_engine_storage=keep_engine_storage)
 
 
 @app.command("download")
@@ -384,10 +514,17 @@ def download_command(config_path: Path, cache_dir: Path | None) -> None:
     help="Results directory. If not provided, uses project results directory.",
 )
 @click.option("--output", "output_path", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--stats/--no-stats",
+    "stats",
+    default=True,
+    help="Also compute the statistical report (bootstrap CI + Holm-corrected pairwise significance).",
+)
 def report_command(
     project_name: str | None,
     input_dir: Path | None,
     output_path: Path,
+    stats: bool,
 ) -> None:
     """Consolidate all run summaries into one analytics artifact.
 
@@ -405,6 +542,13 @@ def report_command(
     index_path = write_results_index(input_dir, input_dir / "index.parquet")
     console.print(f"report={report_path}")
     console.print(f"index={index_path}")
+    if stats:
+        from benchvec.report import write_stats_report
+
+        stats_dir = Path(output_path).parent
+        stats_summary_path, stats_pairwise_path = write_stats_report(input_dir, stats_dir)
+        console.print(f"stats_summary={stats_summary_path}")
+        console.print(f"stats_pairwise={stats_pairwise_path}")
 
 
 @app.command("inspect")
@@ -511,7 +655,7 @@ def charts_command(
     input_dir: Path | None,
     output_dir: Path | None,
 ) -> None:
-    """Generate 6 comparative benchmark charts as PNG files.
+    """Generate the comparative benchmark charts as PNG files.
 
     Charts produced:
 
@@ -526,6 +670,14 @@ def charts_command(
       chart_05_disk_footprint.png — Disk footprint (MB) per engine
 
       chart_06_build_time.png    — Build time / Time-to-serve per engine
+
+      chart_07_concurrency.png   — QPS / latency per concurrency level (C1)
+
+      chart_08_pareto.png        — Recall vs QPS Pareto frontier (sweep)
+
+      chart_09_scaling.png       — Latency / ingest throughput per dataset size (C2)
+
+      chart_10_k_sweep.png       — Recall@K per k value (A2 k-sweep)
 
     Examples:
         uv run python main.py charts --project my-benchmark

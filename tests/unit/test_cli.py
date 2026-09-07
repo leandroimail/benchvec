@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
+from benchvec import cli
 from benchvec.cli import app
 from benchvec.datasets import PreparedDatasetManifest, PreparedRecord
 from benchvec.metrics import BenchmarkSummary, write_env_snapshot, write_summary
@@ -164,8 +165,14 @@ ingest_rates_per_second = [100]
     )
 
     class FakeRunner:
-        def __init__(self, config: object, *, project: object | None = None) -> None:
-            del config, project
+        def __init__(
+            self,
+            config: object,
+            *,
+            project: object | None = None,
+            clean_engine_storage: bool = True,
+        ) -> None:
+            del config, project, clean_engine_storage
 
         def default_query_records(
             self,
@@ -196,9 +203,10 @@ ingest_rates_per_second = [100]
             records: list[PreparedRecord],
             query_records: list[PreparedRecord],
             k: int,
+            ground_truth: object = None,
             repetition_index: int = 0,
         ) -> BenchmarkSummary:
-            del engine_name, records, query_records, k, repetition_index
+            del engine_name, records, query_records, k, ground_truth, repetition_index
             return make_summary("run-a2", "a2")
 
         def run_workload_b1(
@@ -338,3 +346,351 @@ def test_download_command_uses_resolved_cache_dir(
     assert captured["cache_dir"] == tmp_path / ".cache" / "cohere_wikipedia"
     assert "dataset=cohere_wikipedia" in result.stdout
     assert "records=1" in result.stdout
+
+
+@pytest.mark.unit
+def test_run_command_k_sweep_produces_summary_per_k(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "benchvec.toml"
+    config_path.write_text(
+        """
+project_name = "benchvec-k-sweep"
+
+[paths]
+benchmark_dir = ".benchmarks"
+cache_dir = ".cache"
+
+[dataset]
+primary = "cohere_wikipedia"
+sample_size = 2
+
+[engines]
+enabled = ["faiss"]
+
+[workloads]
+repetitions = 1
+k_values = [1, 2, 4]
+ingest_batch_sizes = [2]
+ingest_rates_per_second = [100]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    fake_records = [
+        PreparedRecord(
+            id=f"doc-{index}",
+            text=f"Document {index}",
+            embedding=[float(index), 0.0, 0.0],
+            source_dataset="cohere_wikipedia",
+            document_title=f"Doc {index}",
+            document_length_bucket="short",
+            categoria="data_engineering",
+            tag="engenharia_dados",
+            autor="engenharia",
+            data_criacao=1704067200 + index,
+        )
+        for index in range(4)
+    ]
+    monkeypatch.setattr(
+        cli, "prepare_dataset_from_config", lambda dataset, cache_dir: (None, fake_records)
+    )
+
+    executed_ks: list[int] = []
+
+    class FakeRunner:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        def default_query_records(self, records: list[PreparedRecord]) -> list[PreparedRecord]:
+            return records
+
+        def build_filter_scenarios(self, records: list[PreparedRecord]) -> list[object]:
+            del records
+            return []
+
+        def ground_truth_for_queries(
+            self,
+            records: list[PreparedRecord],
+            queries: list[PreparedRecord],
+            *,
+            k: int,
+        ) -> dict[str, list[str]]:
+            gt_calls.append(k)
+            return {}
+
+        def run_workload_a2(
+            self,
+            engine_name: str,
+            records: list[PreparedRecord],
+            *,
+            query_records: list[PreparedRecord],
+            k: int,
+            ground_truth: object = None,
+            repetition_index: int = 0,
+        ) -> BenchmarkSummary:
+            del engine_name, records, query_records, ground_truth, repetition_index
+            executed_ks.append(k)
+            return make_summary(f"run-a2-k{k}", "a2")
+
+    gt_calls: list[int] = []
+    fake_runner = FakeRunner()
+    monkeypatch.setattr("benchvec.cli.BenchmarkRunner", lambda *a, **kw: fake_runner)
+    result = cli_runner.invoke(cli.run_command, ["--config", str(config_path), "--workload", "a2"])
+
+    assert result.exit_code == 0
+    assert executed_ks == [1, 2, 4]
+    # Ground truth is computed exactly once (at max k), then sliced per k.
+    assert gt_calls == [4]
+
+
+def test_c1_invocation_cleans_shared_storage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """After a c1 run the CLI removes .benchmarks/shared/c1 (review finding 1)."""
+    config_path = tmp_path / "benchvec.toml"
+    config_path.write_text(
+        """
+project_name = "benchvec-c1-cleanup"
+
+[paths]
+benchmark_dir = "benchmarks"
+cache_dir = ".cache"
+
+[dataset]
+primary = "cohere_wikipedia"
+sample_size = 2
+
+[engines]
+enabled = ["faiss"]
+
+[workloads]
+repetitions = 1
+k_values = [2]
+concurrent_workers = [2]
+ingest_batch_sizes = [2]
+ingest_rates_per_second = [100]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "benchmarks" / "shared" / "c1" / "faiss").mkdir(parents=True)
+    (tmp_path / "benchmarks" / "shared" / "c1" / "faiss" / "stale.bin").write_bytes(b"x")
+
+    fake_records = [
+        PreparedRecord(
+            id=f"doc-{index}",
+            text=f"Document {index}",
+            embedding=[float(index), 0.0, 0.0],
+            source_dataset="cohere_wikipedia",
+            document_title=f"Doc {index}",
+            document_length_bucket="short",
+            categoria="data_engineering",
+            tag="engenharia_dados",
+            autor="engenharia",
+            data_criacao=1704067200 + index,
+        )
+        for index in range(2)
+    ]
+
+    class FakeRunner:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def default_query_records(self, records: list[PreparedRecord]) -> list[PreparedRecord]:
+            return records
+
+        def build_filter_scenarios(self, records: list[PreparedRecord]) -> list[object]:
+            del records
+            return []
+
+        def run_workload_a1(self, *args: object, **kwargs: object) -> BenchmarkSummary:
+            return make_summary("run-a1", "a1")
+
+        def run_workload_c1(self, *args: object, **kwargs: object) -> list[BenchmarkSummary]:
+            return [make_summary("run-c1", "c1")]
+
+    monkeypatch.setattr(cli, "prepare_dataset_from_config", lambda dataset, cache_dir: (None, fake_records))
+    monkeypatch.setattr(cli, "BenchmarkRunner", lambda *a, **kw: FakeRunner())
+    result = cli_runner.invoke(cli.run_command, ["--config", str(config_path), "--workload", "c1"])
+
+    assert result.exit_code == 0
+    assert not (tmp_path / "benchmarks" / "shared" / "c1").exists()
+
+
+@pytest.mark.unit
+def test_run_command_turbovec_sweep_grid_uses_bit_width(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The turbovec sweep grid flows from turbovec_bit_width (task 1.5)."""
+    config_path = tmp_path / "benchvec.toml"
+    config_path.write_text(
+        """
+project_name = "benchvec-turbovec-sweep"
+
+[paths]
+benchmark_dir = ".benchmarks"
+cache_dir = ".cache"
+
+[dataset]
+primary = "cohere_wikipedia"
+sample_size = 2
+
+[engines]
+enabled = ["turbovec"]
+distance_metric = "cosine"
+
+[engines.turbovec]
+bit_width = 4
+
+[workloads]
+repetitions = 1
+k_values = [10]
+
+[workloads.param_sweep]
+turbovec_bit_width = [2, 3]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    fake_records = [
+        PreparedRecord(
+            id=f"doc-{index}",
+            text=f"Document {index}",
+            embedding=[float(index), 0.0, 0.0],
+            source_dataset="cohere_wikipedia",
+            document_title=f"Doc {index}",
+            document_length_bucket="short",
+            categoria="data_engineering",
+            tag="engenharia_dados",
+            autor="engenharia",
+            data_criacao=1704067200 + index,
+        )
+        for index in range(2)
+    ]
+    monkeypatch.setattr(
+        cli, "prepare_dataset_from_config", lambda dataset, cache_dir: (None, fake_records)
+    )
+
+    sweep_calls: list[tuple[str, dict[str, list[int]]]] = []
+
+    class FakeRunner:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        def default_query_records(self, records: list[PreparedRecord]) -> list[PreparedRecord]:
+            return records
+
+        def build_filter_scenarios(self, records: list[PreparedRecord]) -> list[object]:
+            del records
+            return []
+
+        def run_param_sweep(
+            self,
+            engine_name: str,
+            records: list[PreparedRecord],
+            *,
+            query_records: list[PreparedRecord],
+            k: int,
+            grid: dict[str, list[int]],
+            max_points: int,
+        ) -> BenchmarkSummary | None:
+            del records, query_records, k, max_points
+            sweep_calls.append((engine_name, dict(grid)))
+            return make_summary(f"run-sweep-{len(sweep_calls)}", "sweep")
+
+    monkeypatch.setattr(
+        "benchvec.cli.BenchmarkRunner", lambda *a, **kw: FakeRunner()
+    )
+    result = cli_runner.invoke(cli.run_command, ["--config", str(config_path), "--workload", "sweep"])
+
+    assert result.exit_code == 0
+    assert sweep_calls == [("turbovec", {"bit_width": [2, 3]})]
+
+
+@pytest.mark.unit
+def test_run_command_turbovec_empty_grid_still_invokes_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Without a configured width grid the sweep is invoked with {} (no-op)."""
+    config_path = tmp_path / "benchvec.toml"
+    config_path.write_text(
+        """
+project_name = "benchvec-turbovec-nosweep"
+
+[paths]
+benchmark_dir = ".benchmarks"
+cache_dir = ".cache"
+
+[dataset]
+primary = "cohere_wikipedia"
+sample_size = 2
+
+[engines]
+enabled = ["turbovec"]
+distance_metric = "cosine"
+
+[workloads]
+repetitions = 1
+k_values = [10]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    fake_records = [
+        PreparedRecord(
+            id=f"doc-{index}",
+            text=f"Document {index}",
+            embedding=[float(index), 0.0, 0.0],
+            source_dataset="cohere_wikipedia",
+            document_title=f"Doc {index}",
+            document_length_bucket="short",
+            categoria="data_engineering",
+            tag="engenharia_dados",
+            autor="engenharia",
+            data_criacao=1704067200 + index,
+        )
+        for index in range(2)
+    ]
+    monkeypatch.setattr(
+        cli, "prepare_dataset_from_config", lambda dataset, cache_dir: (None, fake_records)
+    )
+
+    sweep_calls: list[dict[str, list[int]]] = []
+
+    class FakeRunner:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        def default_query_records(self, records: list[PreparedRecord]) -> list[PreparedRecord]:
+            return records
+
+        def build_filter_scenarios(self, records: list[PreparedRecord]) -> list[object]:
+            del records
+            return []
+
+        def run_param_sweep(
+            self,
+            engine_name: str,
+            records: list[PreparedRecord],
+            *,
+            query_records: list[PreparedRecord],
+            k: int,
+            grid: dict[str, list[int]],
+            max_points: int,
+        ) -> BenchmarkSummary | None:
+            del engine_name, records, query_records, k, max_points
+            sweep_calls.append(dict(grid))
+            return None
+
+    monkeypatch.setattr(
+        "benchvec.cli.BenchmarkRunner", lambda *a, **kw: FakeRunner()
+    )
+    result = cli_runner.invoke(cli.run_command, ["--config", str(config_path), "--workload", "sweep"])
+
+    assert result.exit_code == 0
+    assert sweep_calls == [{}]

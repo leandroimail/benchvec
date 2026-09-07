@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 DistanceMetric = Literal["l2", "cosine"]
-EngineName = Literal["faiss", "chromadb", "lancedb"]
+EngineName = Literal["faiss", "chromadb", "lancedb", "sqlite_vec", "turbovec"]
 
 
 def _default_enabled_engines() -> list[EngineName]:
@@ -64,10 +64,84 @@ class DatasetConfig(BaseModel):
     huggingface_token_env_var: str = "HF_TOKEN"
     fast_wikipedia_dataset_name: str = "not-lain/wikipedia-small-3000-embedded"
     fast_wikipedia_split: str = "train"
-    fast_wikipedia_dataset_name: str = "not-lain/wikipedia-small-3000-embedded"
-    fast_wikipedia_split: str = "train"
     texmex_base_url: str = "http://corpus-texmex.irisa.fr"
     texmex_download_timeout_seconds: int = Field(default=600, gt=0)
+
+
+class LanceDbConfig(BaseModel):
+    """LanceDB index and query-tuning parameters.
+
+    The ``ivfpq`` default is the scientific-fairness fix: without it the
+    adapter only ever runs full scans. The adapter constructor keeps its own
+    conservative ``"none"`` default so legacy callers are unaffected.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    index_type: Literal["none", "ivfpq"] = "ivfpq"
+    num_partitions: int = Field(default=8, gt=0)
+    num_sub_vectors: int = Field(default=16, gt=0)
+    nprobes: int = Field(default=8, gt=0)
+    # 0 or 1 means "no refinement" (lancedb's default); >=2 enables it.
+    refine_factor: int = Field(default=1, ge=0)
+
+
+class ChromaConfig(BaseModel):
+    """ChromaDB HNSW search parameters.
+
+    HNSW ``ef`` is fixed at collection creation, so sweeping it requires a
+    rebuild per grid point; the grid stays disabled by default.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    search_ef: int = Field(default=64, gt=0)
+    ef_search_grid_enabled: bool = False
+    ef_search_grid: list[int] = Field(default_factory=list)
+
+
+class TurboVecConfig(BaseModel):
+    """TurboVec quantization parameters.
+
+    ``bit_width`` is a build-time knob (the index is constructed with it),
+    so sweeping it requires a rebuild + re-ingest per grid point (mirrors
+    the Chroma ``ef`` constraint). ``calibrate`` enables the optional TQ+
+    per-coordinate calibration (~1024-row sample) at build time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    bit_width: Literal[2, 3, 4] = 4
+    calibrate: bool = False
+
+
+class ParamSweepConfig(BaseModel):
+    """Search-parameter grids for the Recall-QPS Pareto sweep workload."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    faiss_nprobe: list[int] = Field(default_factory=list)
+    lancedb_nprobes: list[int] = Field(default_factory=list)
+    lancedb_refine_factor: list[int] = Field(default_factory=list)
+    turbovec_bit_width: list[int] = Field(default_factory=list)
+    max_points: int = Field(default=20_000, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_grid_values(self) -> ParamSweepConfig:
+        """Reject invalid grid values (nprobe/nprobes >= 1, refine >= 0)."""
+
+        for grid_name, minimum in (
+            ("faiss_nprobe", 1),
+            ("lancedb_nprobes", 1),
+            ("lancedb_refine_factor", 0),
+        ):
+            grid = getattr(self, grid_name)
+            if any(value < minimum for value in grid):
+                raise ValueError(f"{grid_name} values must be >= {minimum}")
+        # Bit widths are fixed by the library contract (probed: 2, 3, 4).
+        if any(value not in (2, 3, 4) for value in self.turbovec_bit_width):
+            raise ValueError("turbovec_bit_width values must be in {2, 3, 4}")
+        return self
 
 
 class EngineConfig(BaseModel):
@@ -79,6 +153,29 @@ class EngineConfig(BaseModel):
     distance_metric: DistanceMetric = "l2"
     faiss_index_type: Literal["flat", "ivfflat"] = "flat"
     faiss_nlist: int = Field(default=100, gt=0)
+    # 0 means "FAISS library default" (only meaningful for ivfflat; flat
+    # ignores it). The adapter translates the sentinel before touching the index.
+    faiss_nprobe: int = Field(default=0, ge=0)
+    lancedb: LanceDbConfig = Field(default_factory=LanceDbConfig)
+    chroma: ChromaConfig = Field(default_factory=ChromaConfig)
+    turbovec: TurboVecConfig = Field(default_factory=TurboVecConfig)
+
+    @model_validator(mode="after")
+    def _validate_turbovec_metric(self) -> EngineConfig:
+        """Fail fast when turbovec is enabled under an unsupported metric.
+
+        TurboVec's kernel is inner-product-only (probed), so an ``l2``
+        campaign would only fail mid-run inside the adapter (blast radius:
+        the whole multi-engine run). Rejecting it at config load keeps the
+        error at the earliest possible moment.
+        """
+
+        if "turbovec" in self.enabled and self.distance_metric == "l2":
+            raise ValueError(
+                "engines.turbovec requires engines.distance_metric='cosine' "
+                "(turbovec's kernel is inner-product-only; l2 is not supported)"
+            )
+        return self
 
 
 class WorkloadConfig(BaseModel):
@@ -92,6 +189,9 @@ class WorkloadConfig(BaseModel):
     ingest_batch_sizes: list[int] = Field(default_factory=lambda: [1_000])
     ingest_rates_per_second: list[int] = Field(default_factory=lambda: [100])
     concurrent_workers: list[int] = Field(default_factory=lambda: [1])
+    sample_sizes: list[int] = Field(default_factory=list)
+    max_c2_queries: int = Field(default=20_000, gt=0)
+    param_sweep: ParamSweepConfig = Field(default_factory=ParamSweepConfig)
 
 
 class BenchmarkConfig(BaseModel):

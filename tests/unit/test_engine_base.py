@@ -39,4 +39,4 @@ def test_metadata_filter_serializes_for_backends() -> None:
             {"year": {"$gte": 2024}},
         ]
     }
-    assert filters.to_lancedb_where() == 'tag = "engenharia_dados" AND year >= 2024'
+    assert filters.to_lancedb_where() == "tag = 'engenharia_dados' AND year >= 2024"

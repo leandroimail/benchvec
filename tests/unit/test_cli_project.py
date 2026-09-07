@@ -68,16 +68,40 @@ def make_summary(run_id: str, workload: str) -> BenchmarkSummary:
 
 @pytest.fixture
 def cleanup_projects(tmp_path: Path) -> None:
-    """Clean up project directories after test.
-    
-    Args:
-        tmp_path: Temporary directory for test artifacts
+    """Remove only the project directories the test created.
+
+    The project commands write under the repo-level ``.benchmarks/projects``
+    (the project base path is process-wide, not tmp_path-relative), so the
+    fixture snapshots the existing projects and deletes just the newcomers.
+    Deleting the whole tree here would also destroy real campaign results
+    (it silently wiped ``benchmark_default`` on every full-suite run).
     """
-    yield
-    # Clean up .benchmarks/projects directory
     projects_dir = Path(".benchmarks") / "projects"
+    before = (
+        {child.name for child in projects_dir.iterdir()}
+        if projects_dir.exists()
+        else set()
+    )
+    yield
     if projects_dir.exists():
-        shutil.rmtree(projects_dir, ignore_errors=True)
+        for child in projects_dir.iterdir():
+            if child.name not in before:
+                shutil.rmtree(child, ignore_errors=True)
+
+
+@pytest.fixture
+def isolated_projects_base(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Path:
+    """Point ``PROJECTS_BASE_PATH`` at a temp dir for default-project tests.
+
+    The default-project tests target ``benchmark_default`` by name — the
+    same folder a real campaign occupies — so they must not touch the
+    repository's real ``.benchmarks`` tree at all.
+    """
+    base = tmp_path / "projects"
+    monkeypatch.setattr("benchvec.project.PROJECTS_BASE_PATH", base)
+    return base
 
 
 @pytest.fixture
@@ -174,16 +198,16 @@ class TestProjectInitCommand:
     @pytest.mark.unit
     def test_init_default_project_name(
         self,
-        cleanup_projects: None,
+        isolated_projects_base: Path,
     ) -> None:
         """Verify init creates benchmark_default when no --project provided.
-        
+
         Ensures backward compatibility: default project name is used
         """
         result = cli_runner.invoke(app, ["init"])
 
         assert result.exit_code == 0
-        project_base = PROJECTS_BASE_PATH / "benchmark_default"
+        project_base = isolated_projects_base / "benchmark_default"
         assert project_base.exists()
 
     @pytest.mark.unit
@@ -276,7 +300,7 @@ class TestProjectReportCommand:
     @pytest.mark.unit
     def test_report_default_project_when_no_flag(
         self,
-        cleanup_projects: None,
+        isolated_projects_base: Path,
         tmp_path: Path,
     ) -> None:
         """Verify report without --project uses benchmark_default.
@@ -367,7 +391,7 @@ class TestProjectInspectCommand:
     @pytest.mark.unit
     def test_inspect_default_project_when_no_flag(
         self,
-        cleanup_projects: None,
+        isolated_projects_base: Path,
     ) -> None:
         """Verify inspect without --project uses benchmark_default.
         
@@ -470,7 +494,7 @@ class TestProjectBackwardCompatibility:
     @pytest.mark.unit
     def test_commands_work_without_project_flag(
         self,
-        cleanup_projects: None,
+        isolated_projects_base: Path,
         tmp_path: Path,
     ) -> None:
         """Verify all commands work without --project flag.
@@ -509,16 +533,16 @@ class TestProjectBackwardCompatibility:
     @pytest.mark.unit
     def test_init_default_creates_benchmark_default(
         self,
-        cleanup_projects: None,
+        isolated_projects_base: Path,
     ) -> None:
         """Verify init without --project creates benchmark_default.
-        
+
         Ensures that init command defaults to benchmark_default when no project specified
         """
         result = cli_runner.invoke(app, ["init"])
 
         assert result.exit_code == 0
-        project_base = PROJECTS_BASE_PATH / "benchmark_default"
+        project_base = isolated_projects_base / "benchmark_default"
         assert project_base.exists()
 
 

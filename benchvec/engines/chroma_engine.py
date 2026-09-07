@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import re
 from pathlib import Path
-from typing import Any, Iterable, Mapping, cast
+from typing import Any, Iterable, Mapping, Sequence, cast
 
 import numpy as np
 
@@ -27,6 +28,8 @@ _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # ChromaDB enforces a hard limit on batch size per .add() call
 # (InternalError raised above this threshold in all versions up to 1.x)
 _CHROMA_MAX_BATCH_SIZE: int = 5461
+
+logger = logging.getLogger(__name__)
 
 
 def _iso_date_to_unix(value: str) -> int:
@@ -89,7 +92,13 @@ def _normalize_vector(vector: list[float]) -> list[float]:
 
 
 class ChromaEngine(BenchmarkEngine):
-    """Adapter around ChromaDB PersistentClient collections."""
+    """Adapter around ChromaDB PersistentClient collections.
+
+    HNSW ``ef`` is fixed at collection creation: sweeping it requires a
+    rebuild per grid point (``rebuild_with_ef``, used only by the gated
+    Pareto sweep). ``last_search_params`` reports the ef applied at query
+    time, which is always the creation-time value.
+    """
 
     def __init__(
         self,
@@ -97,6 +106,9 @@ class ChromaEngine(BenchmarkEngine):
         *,
         collection_name: str = "benchvec",
         distance_metric: DistanceMetric = "l2",
+        search_ef: int = 64,
+        ef_search_grid_enabled: bool = False,
+        ef_search_grid: list[int] | None = None,
     ) -> None:
         self.name = "chromadb"
         self.distance_metric = distance_metric
@@ -104,6 +116,11 @@ class ChromaEngine(BenchmarkEngine):
         self.native_filtering = True
         self.storage_path = Path(storage_path)
         self.collection_name = collection_name
+        self.search_ef = search_ef
+        self.ef_search_grid_enabled = ef_search_grid_enabled
+        self.ef_search_grid = list(ef_search_grid or [])
+        self.last_search_params: dict[str, Any] = {}
+        self.ef_creation_mode: str = "pending"
         self._client: Any | None = None
         self._collection: Any | None = None
 
@@ -116,11 +133,56 @@ class ChromaEngine(BenchmarkEngine):
             path=str(self.storage_path),
             settings=Settings(allow_reset=True, anonymized_telemetry=False),
         )
-        self._collection = self._client.get_or_create_collection(
-            self.collection_name,
-            metadata={"hnsw:space": "cosine" if self.distance_metric == "cosine" else "l2"},
-            embedding_function=None,
+        self._collection = self._get_or_create_collection()
+        logger.info(
+            "chromadb collection created with ef_search=%d via %s",
+            self.search_ef,
+            self.ef_creation_mode,
         )
+
+    def _get_or_create_collection(self) -> Any:
+        """Create the collection, preferring the chromadb 1.x configuration API.
+
+        Falls back to legacy ``hnsw:*`` metadata when ``configuration=`` is
+        rejected. The two mechanisms are never used simultaneously;
+        construction ef stays at the library default.
+        """
+
+        assert self._client is not None
+        space = "cosine" if self.distance_metric == "cosine" else "l2"
+        try:
+            collection = self._client.get_or_create_collection(
+                self.collection_name,
+                configuration={"hnsw": {"space": space, "ef_search": self.search_ef}},
+                embedding_function=None,
+            )
+            self.ef_creation_mode = "configuration"
+            return collection
+        except Exception as exc:
+            # chromadb raises typed errors (InvalidArgumentError etc.) that do
+            # not share a ValueError base; any failure here means the
+            # configuration API is unavailable on this install.
+            logger.debug("configuration= path rejected, using legacy metadata: %s", exc)
+            collection = self._client.get_or_create_collection(
+                self.collection_name,
+                metadata={"hnsw:space": space, "hnsw:search_ef": self.search_ef},
+                embedding_function=None,
+            )
+            self.ef_creation_mode = "legacy-metadata"
+            return collection
+
+    def rebuild_with_ef(self, search_ef: int) -> None:
+        """Drop and recreate the collection with a new ef (data must be re-ingested)."""
+
+        self.search_ef = search_ef
+        if self._client is None:
+            self.connect()
+        assert self._client is not None
+        try:
+            self._client.delete_collection(self.collection_name)
+        except Exception:
+            pass
+        self._collection = self._get_or_create_collection()
 
     def reset(self) -> None:
         if self._client is None:
@@ -169,6 +231,41 @@ class ChromaEngine(BenchmarkEngine):
     def build_index(self) -> None:
         return None
 
+    def delete(self, ids: Sequence[str]) -> int:
+        if self._collection is None:
+            self.connect()
+        assert self._collection is not None
+        if not ids:
+            return 0
+        self._collection.delete(ids=list(ids))
+        # ChromaDB delete does not report how many ids existed.
+        return len(list(ids))
+
+    def upsert(self, records: Sequence[EngineRecord]) -> None:
+        if self._collection is None:
+            self.connect()
+        assert self._collection is not None
+        if not records:
+            return
+        record_list = list(records)
+        # The chromadb hard per-call limit applies to upsert as well.
+        for offset in range(0, len(record_list), _CHROMA_MAX_BATCH_SIZE):
+            chunk = record_list[offset : offset + _CHROMA_MAX_BATCH_SIZE]
+            embeddings = [
+                _normalize_vector(record.embedding)
+                if self.distance_metric == "cosine"
+                else record.embedding
+                for record in chunk
+            ]
+            self._collection.upsert(
+                ids=[record.id for record in chunk],
+                embeddings=embeddings,
+                documents=[record.document for record in chunk],
+                metadatas=[
+                    _normalize_metadata_for_chroma(record.metadata) for record in chunk
+                ],
+            )
+
     def search(
         self,
         query: list[float],
@@ -203,6 +300,7 @@ class ChromaEngine(BenchmarkEngine):
 
         query_vector = _normalize_vector(query) if self.distance_metric == "cosine" else query
         where_clause = _build_chroma_where(filters) if filters is not None else None
+        self.last_search_params = {"ef_search": self.search_ef}
         result = self._collection.query(
             query_embeddings=[query_vector],
             n_results=k,

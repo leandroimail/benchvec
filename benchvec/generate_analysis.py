@@ -5,7 +5,7 @@ generate_analysis.py — Deterministic Benchmark Analysis Report Generator
 Reads consolidated Parquet results from a BenchVec project and produces a
 structured ANALYSIS_REPORT.md markdown file in the project directory.
 
-Adapted from .benchmarks/projects/sbbd-2026-old/scripts_complementaries/
+Standalone analysis generator for consolidated benchmark results.
 Usage:
     python generate_analysis.py --project-dir <path> [--dataset-name <name>]
 """
@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
         "--project-dir",
         required=True,
         type=Path,
-        help="Path to the benchmark project directory (e.g. .benchmarks/projects/sbbd-2026-sift1m)",
+        help="Path to the benchmark project directory (e.g. .benchmarks/projects/benchmark_default)",
     )
     parser.add_argument(
         "--dataset-name",
@@ -111,6 +111,10 @@ WORKLOAD_LABELS: dict[str, str] = {
     "b2": "B2 — Persistent Streaming Ingestion",
     "b3": "B3 — Index Reopen After Persistence",
     "b4": "B4 — Memory Pressure",
+    "c1": "C1 — Concurrent Search (Thread Ladder)",
+    "c2": "C2 — Dataset Scaling Ladder",
+    "d1": "D1 — Delete & Upsert Lifecycle",
+    "sweep": "Sweep — Recall-QPS Parameter Sweep",
 }
 
 
@@ -345,6 +349,61 @@ def build_statistical_analysis(df: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+def build_significance_section(project_dir: Path) -> str:
+    """Build the pairwise significance section from stats_pairwise.parquet.
+
+    Values come from benchvec.statistics (Mann-Whitney U with Holm step-down
+    correction within each workload family); the section is omitted when the
+    parquet is absent so legacy projects keep their previous output.
+    """
+
+    import pyarrow.parquet as pq
+
+    project_dir_path = Path(project_dir)
+    candidates = [
+        project_dir_path / "stats_pairwise.parquet",
+        project_dir_path / "reports" / "stats_pairwise.parquet",
+        # The CLI points input_dir at <project>/results; reports live one up.
+        project_dir_path.parent / "reports" / "stats_pairwise.parquet",
+    ]
+    pairwise_path = next((candidate for candidate in candidates if candidate.exists()), None)
+    if pairwise_path is None:
+        return ""
+    try:
+        rows = pq.read_table(pairwise_path).to_pylist()
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+
+    lines: list[str] = [
+        "## Statistical Significance (Pairwise Engine Comparisons)\n",
+        "Mann-Whitney U on per-query latencies; Holm step-down correction "
+        "applied within each workload family (alpha = 0.05).\n",
+        "| Workload | k | Concurrency | Dataset Size | Engine A | Engine B | ΔMean % | p-value | Holm-adj. p | Significant |",
+        "|----------|---|-------------|--------------|----------|----------|---------|---------|-------------|-------------|",
+    ]
+    for row in rows[:100]:
+        delta = row.get("delta_mean_pct")
+        delta_text = f"{delta:+.1f}%" if delta is not None else "n/a"
+        p_value = row.get("p_value")
+        p_text = f"{p_value:.2e}" if p_value is not None and p_value == p_value else "n/a"
+        holm_p = row.get("holm_adjusted_p")
+        holm_text = f"{holm_p:.2e}" if holm_p is not None and holm_p == holm_p else "n/a"
+        significant = row.get("significant_at_0_05")
+        lines.append(
+            f"| {row.get('workload')} "
+            f"| {row.get('k') if row.get('k') is not None else '-'} "
+            f"| {row.get('concurrency_level') if row.get('concurrency_level') is not None else '-'} "
+            f"| {row.get('dataset_size') if row.get('dataset_size') is not None else '-'} "
+            f"| {row.get('engine_a')} | {row.get('engine_b')} "
+            f"| {delta_text} | {p_text} | {holm_text} "
+            f"| {'yes' if significant else 'no'} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def build_key_findings(df: pd.DataFrame, dataset_name: str) -> str:
     """Generate key findings from the benchmark data."""
     lines: list[str] = ["## 5. Key Findings\n"]
@@ -542,6 +601,11 @@ def generate_report(config: AnalysisConfig) -> Path:
         sections.append(build_statistical_analysis(df))
     
     if config.report_type == ReportType.detailed:
+        significance_section = build_significance_section(project_dir)
+        if significance_section:
+            sections.append(significance_section)
+    
+    if config.report_type in (ReportType.executive_summary, ReportType.detailed):
         sections.append(build_methodology_section(df, dataset_name))
         if config.include_charts:
             sections.append(build_charts_section(project_dir))

@@ -67,6 +67,10 @@ class BenchmarkSummary(BaseModel):
     error_message: str | None = None
     host_fingerprint: dict[str, Any]
     raw_data_path: str
+    concurrency: int | None = Field(default=None, ge=1)
+    delete_time_s: float | None = Field(default=None, ge=0)
+    upsert_time_s: float | None = Field(default=None, ge=0)
+    post_delete_recall: float | None = Field(default=None, ge=0, le=1)
 
 
 def new_run_id() -> str:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import pandas as pd
 import pyarrow as pa
@@ -257,8 +257,8 @@ def inspect_run(
 
 _CHART_PALETTE = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2", "#937860"]
 
-_WORKLOAD_ORDER = ["a1", "a2", "b1", "b2", "b3", "b4"]
-_ENGINE_ORDER = ["faiss", "chromadb", "lancedb"]
+_WORKLOAD_ORDER = ["a1", "a2", "b1", "b2", "b3", "b4", "c1", "c2", "d1", "sweep"]
+_ENGINE_ORDER = ["faiss", "chromadb", "lancedb", "sqlite_vec", "turbovec"]
 
 
 def _safe_df(
@@ -282,13 +282,87 @@ def _safe_df(
     return pd.DataFrame([s.model_dump(mode="json") for s in summaries])
 
 
+def pareto_mask(qps_values: Sequence[float], recall_values: Sequence[float]) -> list[bool]:
+    """Return the Pareto-optimal subset (no other point beats both axes).
+
+    A point is dominated when some other point has strictly higher QPS and
+    recall. Pure helper so chart 08's frontier is unit-testable.
+    """
+
+    mask: list[bool] = []
+    for index, (qps, recall) in enumerate(zip(qps_values, recall_values)):
+        dominated = any(
+            other_qps > qps and other_recall > recall
+            for other_index, (other_qps, other_recall) in enumerate(zip(qps_values, recall_values))
+            if other_index != index
+        )
+        mask.append(not dominated)
+    return mask
+
+
+def collect_workload_raw_rows(results_dir: str | Path, workload: str) -> list[dict[str, Any]]:
+    """Collect raw query rows for one workload across every run directory."""
+
+    import pyarrow.parquet as pq
+
+    rows: list[dict[str, Any]] = []
+    results_path = Path(results_dir)
+    if not results_path.exists():
+        return rows
+    for parquet_path in sorted(results_path.glob("**/raw_queries_*.parquet")):
+        try:
+            table = pq.read_table(parquet_path)
+        except Exception:  # pragma: no cover - unreadable partial files
+            continue
+        for row in table.to_pylist():
+            if row.get("workload") == workload:
+                rows.append(row)
+    return rows
+
+
+def write_stats_report(
+    results_dir: str | Path,
+    out_dir: str | Path,
+    *,
+    seed: int = 42,
+) -> tuple[Path, Path]:
+    """Compute and persist the statistical report (CI + significance).
+
+    Writes ``stats_summary.parquet`` (per workload × engine × k ×
+    concurrency: bootstrap CI, CV, mean recall) and ``stats_pairwise.parquet``
+    (pairwise Mann-Whitney with Holm step-down correction) using
+    ``benchvec.statistics.aggregate_engine_stats``.
+    """
+
+    from benchvec.statistics import STATS_PAIRWISE_SCHEMA, STATS_SUMMARY_SCHEMA, aggregate_engine_stats
+
+    summaries = consolidate_summaries(results_dir)
+    raw_rows: list[dict[str, Any]] = []
+    for workload in ("a2", "b1", "b2", "b3", "b4", "c1", "c2", "d1", "sweep"):
+        raw_rows.extend(collect_workload_raw_rows(results_dir, workload))
+    stats_summary, stats_pairwise = aggregate_engine_stats(summaries, raw_rows, seed=seed)
+
+    target_dir = Path(out_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = target_dir / "stats_summary.parquet"
+    pairwise_path = target_dir / "stats_pairwise.parquet"
+    pq.write_table(stats_summary.cast(STATS_SUMMARY_SCHEMA), summary_path)
+    pq.write_table(stats_pairwise.cast(STATS_PAIRWISE_SCHEMA), pairwise_path)
+    logger.info(
+        "stats report written: %d summary rows, %d pairwise rows",
+        stats_summary.num_rows,
+        stats_pairwise.num_rows,
+    )
+    return summary_path, pairwise_path
+
+
 def generate_charts(
     results_dir: str | Path | None = None,
     output_dir: str | Path | None = None,
     *,
     project: Optional[Project] = None,
 ) -> list[Path]:
-    """Generate 6 comparative benchmark charts and save them as PNG files.
+    """Generate the comparative benchmark charts and save them as PNG files.
 
     Charts produced:
     1. Latency comparison (mean / p95 / p99) per engine × workload
@@ -297,6 +371,10 @@ def generate_charts(
     4. Peak RAM (MB) per engine × workload
     5. Disk footprint (MB) per engine (aggregated across workloads)
     6. Build time / Time-to-serve per engine (aggregated)
+    7. Concurrency: QPS / latency per thread level (C1)
+    8. Pareto frontier: recall vs QPS per search-params point (sweep)
+    9. Scaling: latency / recall per dataset size (C2)
+    10. k-sweep: Recall@K per k value (A2)
     
     Args:
         results_dir: Optional path to results directory. If None and project is provided,
@@ -355,6 +433,22 @@ def generate_charts(
         )
 
     generated: list[Path] = []
+
+    # Keep the full frame for chart 10 (the k-sweep view needs every k);
+    # charts 01-03 below use the k-filtered frame.
+    full_df = df
+    # k-sweep support: charts 01-03 must not mix A2 rows across k levels
+    # (their latencies/recalls differ systematically), so keep only the
+    # largest k when several are present.
+    if "workload" in df.columns and "k" in df.columns:
+        a2_mask = df["workload"] == "a2"
+        a2_ks = df.loc[a2_mask, "k"].dropna()
+        if a2_ks.nunique() > 1:
+            max_k = a2_ks.max()
+            df = pd.concat(
+                [df[~a2_mask], df[a2_mask & (df["k"] == max_k)]],
+                ignore_index=True,
+            )
 
     # ------------------------------------------------------------------
     # Chart 1 — Latency: mean / p95 / p99
@@ -528,6 +622,149 @@ def generate_charts(
         fig.savefig(path6, dpi=150)
         plt.close(fig)
         generated.append(path6)
+
+    # ------------------------------------------------------------------
+    # Chart 7 — Concurrency: QPS and p95 latency vs thread count (C1)
+    # ------------------------------------------------------------------
+    c1_df = df[(df["workload"] == "c1") & df["concurrency"].notna()].copy()
+    if not c1_df.empty:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        for engine_name, engine_group in c1_df.groupby("engine", observed=True):
+            grouped = engine_group.groupby("concurrency", observed=True).median(numeric_only=True)
+            axes[0].plot(grouped.index, grouped["qps"], marker="o", label=str(engine_name))
+            axes[1].plot(grouped.index, grouped["p95_latency_ms"], marker="o", label=str(engine_name))
+        axes[0].set_title("QPS vs Concurrent Threads (C1)")
+        axes[0].set_xlabel("Threads")
+        axes[0].set_ylabel("QPS")
+        axes[1].set_title("p95 Latency vs Concurrent Threads (C1)")
+        axes[1].set_xlabel("Threads")
+        axes[1].set_ylabel("p95 Latency (ms)")
+        for axis in axes:
+            axis.legend(title="Engine")
+        fig.tight_layout()
+        path7 = out_dir / "chart_07_concurrency.png"
+        fig.savefig(path7, dpi=150)
+        plt.close(fig)
+        generated.append(path7)
+
+    # ------------------------------------------------------------------
+    # Chart 8 — Pareto frontier: Recall vs QPS per search-params point
+    # ------------------------------------------------------------------
+    sweep_rows = collect_workload_raw_rows(results_dir, "sweep")
+    sweep_points = [
+        {
+            "engine": row.get("engine"),
+            "search_params": json.dumps(row.get("search_params"), sort_keys=True)
+            if row.get("search_params")
+            else "{}",
+            "latency_ms": latency,
+            "recall_at_k": recall,
+        }
+        for row in sweep_rows
+        for latency, recall in [
+            (
+                row.get("latency_ms"),
+                row.get("recall_at_k"),
+            )
+        ]
+        if latency is not None and recall is not None
+    ]
+    if sweep_points:
+        sweep_df = pd.DataFrame(sweep_points)
+        point_stats = (
+            sweep_df.groupby(["engine", "search_params"])
+            .agg(mean_recall=("recall_at_k", "mean"), total_latency=("latency_ms", "sum"), n=("latency_ms", "size"))
+            .reset_index()
+        )
+        point_stats["qps"] = point_stats["n"] / (point_stats["total_latency"] / 1000.0)
+        fig, ax = plt.subplots(figsize=(10, 7))
+        for engine_name, engine_group in point_stats.groupby("engine"):
+            ordered = engine_group.sort_values("qps")
+            frontier = pareto_mask(
+                ordered["qps"].tolist(),
+                ordered["mean_recall"].tolist(),
+            )
+            ax.plot(ordered["qps"], ordered["mean_recall"], marker="o", alpha=0.4, label=None)
+            frontier_points = ordered[frontier]
+            ax.plot(
+                frontier_points["qps"],
+                frontier_points["mean_recall"],
+                marker="o",
+                linewidth=2,
+                label=str(engine_name),
+            )
+        ax.set_xscale("log")
+        ax.set_title("Recall vs QPS Frontier per Search-Params Point (Sweep)")
+        ax.set_xlabel("QPS (log scale)")
+        ax.set_ylabel("Mean Recall@K")
+        ax.legend(title="Engine (Pareto frontier)")
+        fig.tight_layout()
+        path8 = out_dir / "chart_08_pareto.png"
+        fig.savefig(path8, dpi=150)
+        plt.close(fig)
+        generated.append(path8)
+
+    # ------------------------------------------------------------------
+    # Chart 9 — Scaling: latency and ingest throughput vs dataset size (C2)
+    # ------------------------------------------------------------------
+    c2_df = df[(df["workload"] == "c2") & df["dataset_size"].notna()].copy()
+    if not c2_df.empty:
+        c2_df["ingest_vps"] = c2_df.apply(
+            lambda row: row["dataset_size"] / row["load_time_s"]
+            if row["load_time_s"] and row["load_time_s"] > 0
+            else 0.0,
+            axis=1,
+        )
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        for engine_name, engine_group in c2_df.groupby("engine", observed=True):
+            grouped = engine_group.groupby("dataset_size").median(numeric_only=True)
+            axes[0].plot(grouped.index, grouped["mean_latency_ms"], marker="o", label=str(engine_name))
+            axes[1].plot(grouped.index, grouped["ingest_vps"], marker="o", label=str(engine_name))
+        for axis in axes:
+            axis.set_xscale("log")
+            axis.set_xlabel("Dataset Size (vectors, log)")
+            axis.legend(title="Engine")
+        axes[0].set_title("Mean Latency vs Dataset Size (C2)")
+        axes[0].set_ylabel("Mean Latency (ms)")
+        axes[1].set_title("Ingest Throughput vs Dataset Size (C2)")
+        axes[1].set_ylabel("Vectors / Second")
+        fig.tight_layout()
+        path9 = out_dir / "chart_09_scaling.png"
+        fig.savefig(path9, dpi=150)
+        plt.close(fig)
+        generated.append(path9)
+
+    # ------------------------------------------------------------------
+    # Chart 10 — k-sweep: recall and latency vs k (A2 summaries)
+    # ------------------------------------------------------------------
+    a2_all = full_df[full_df["workload"] == "a2"].copy()
+    if not a2_all.empty and a2_all["k"].nunique() > 1:
+        fig, ax1 = plt.subplots(figsize=(11, 6))
+        ax2 = ax1.twinx()
+        for engine_name, engine_group in a2_all.groupby("engine", observed=True):
+            grouped = engine_group.groupby("k").mean(numeric_only=True)
+            ax1.bar(
+                grouped.index,
+                grouped["recall_at_k"],
+                width=(grouped.index.max() - grouped.index.min()) / (len(grouped) * 3 + 1),
+                alpha=0.5,
+                label=f"{engine_name} recall",
+            )
+            ax2.plot(grouped.index, grouped["mean_latency_ms"], marker="s", label=f"{engine_name} latency")
+        ax1.set_xscale("log")
+        ax1.set_xlabel("k (log scale)")
+        ax1.set_ylabel("Recall@K")
+        ax1.set_ylim(0.0, 1.05)
+        ax2.set_ylabel("Mean Latency (ms)")
+        ax1.set_title("Recall and Latency vs k (A2 k-Sweep)")
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="lower right", fontsize=8)
+        fig.tight_layout()
+        path10 = out_dir / "chart_10_k_sweep.png"
+        fig.savefig(path10, dpi=150)
+        plt.close(fig)
+        generated.append(path10)
 
     if project:
         logger.info(f"Generated {len(generated)} charts for project to {output_dir}")

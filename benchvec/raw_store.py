@@ -43,6 +43,9 @@ class RawRecord(BaseModel):
     ram_mb: float | None = Field(default=None, ge=0)
     ram_after_mb: float | None = Field(default=None, ge=0)
     error: str | None = None
+    concurrency_level: int | None = Field(default=None, ge=1)
+    search_params: dict[str, Any] | None = None
+    dataset_size: int | None = Field(default=None, ge=0)
 
 
 def _table_from_records(records: list[RawRecord]) -> pa.Table:

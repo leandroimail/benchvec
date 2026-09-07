@@ -104,13 +104,13 @@ class TestDetectDatasetName:
     def test_detect_from_project_name_cohere(self) -> None:
         """Test detecting dataset from project directory name (Cohere)."""
         df = pd.DataFrame({"metric": [100]})
-        name = detect_dataset_name(df, Path("/some/sbbd-2026-cohere"))
+        name = detect_dataset_name(df, Path("/some/cohere-benchmark"))
         assert "Cohere" in name
 
     def test_detect_from_project_name_sift(self) -> None:
         """Test detecting dataset from project directory name (SIFT)."""
         df = pd.DataFrame({"metric": [100]})
-        name = detect_dataset_name(df, Path("/some/sbbd-2026-sift1m"))
+        name = detect_dataset_name(df, Path("/some/sift1m-benchmark"))
         assert "SIFT" in name
 
 
@@ -319,3 +319,69 @@ class TestOutputFormats:
         assert ReportType.executive_summary.value == "executive_summary"
         assert ReportType.detailed.value == "detailed"
         assert ReportType.statistical_only.value == "statistical_only"
+
+
+class TestSignificanceSection:
+    """Tests for the Holm-corrected pairwise significance section."""
+
+    def test_markdown_includes_significance_when_parquet_present(self, tmp_path: Path) -> None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from benchvec.statistics import STATS_PAIRWISE_SCHEMA
+
+        reports_dir = tmp_path / "reports"
+        reports_dir.mkdir(parents=True)
+        pd.DataFrame({"engine": ["faiss"], "workload": ["a2"], "mean_latency_ms": [1.0], "qps": [100.0], "recall_at_k": [0.99]}).to_parquet(
+            reports_dir / "final.parquet"
+        )
+        pairwise_rows = [
+            {
+                "workload": "a2",
+                "k": 10,
+                "concurrency_level": -1,
+                "engine_a": "faiss",
+                "engine_b": "chromadb",
+                "delta_mean_pct": 42.0,
+                "u_statistic": 12.0,
+                "p_value": 0.003,
+                "holm_adjusted_p": 0.009,
+                "significant_at_0_05": True,
+            }
+        ]
+        pq.write_table(
+            pa.Table.from_pylist(pairwise_rows, schema=STATS_PAIRWISE_SCHEMA),
+            tmp_path / "stats_pairwise.parquet",
+        )
+
+        output_file = tmp_path / "report.md"
+        config = AnalysisConfig(
+            input_dir=tmp_path,
+            output_path=output_file,
+            output_format=OutputFormat.markdown,
+        )
+        result_path = generate_report(config)
+
+        assert result_path == output_file
+        content = output_file.read_text(encoding="utf-8")
+        assert "Statistical Significance" in content
+        assert "Holm" in content
+        assert "+42.0%" in content
+
+    def test_markdown_omits_significance_when_parquet_absent(self, tmp_path: Path) -> None:
+        reports_dir = tmp_path / "reports"
+        reports_dir.mkdir(parents=True)
+        pd.DataFrame({"engine": ["faiss"], "workload": ["a2"], "mean_latency_ms": [1.0], "qps": [100.0], "recall_at_k": [0.99]}).to_parquet(
+            reports_dir / "final.parquet"
+        )
+
+        output_file = tmp_path / "report.md"
+        config = AnalysisConfig(
+            input_dir=tmp_path,
+            output_path=output_file,
+            output_format=OutputFormat.markdown,
+        )
+        generate_report(config)
+
+        content = output_file.read_text(encoding="utf-8")
+        assert "Statistical Significance" not in content

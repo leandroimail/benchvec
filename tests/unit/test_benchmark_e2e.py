@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 import pytest
 
@@ -66,6 +66,17 @@ class E2EFakeEngine(BenchmarkEngine):
         del metric, params
         filtered = [record for record in self._records if filters.matches(record.metadata)]
         return self._search_records(filtered, query, k)
+
+    def delete(self, ids: Sequence[str]) -> int:
+        id_set = set(ids)
+        before = len(self._records)
+        self._records = [record for record in self._records if record.id not in id_set]
+        return before - len(self._records)
+
+    def upsert(self, records: Sequence[EngineRecord]) -> None:
+        materialized = list(records)
+        self.delete([record.id for record in materialized])
+        self._records.extend(materialized)
 
     def persist(self) -> None:
         self._persisted_records = list(self._records)

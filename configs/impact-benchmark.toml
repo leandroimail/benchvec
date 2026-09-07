@@ -1,0 +1,95 @@
+# BenchVec — Impact Profile (full expansion campaign, 5 engines)
+# Validated on MacBook M5 (16 GB, Sep 2026), dataset cache warm: the
+# 5-engine cosine campaign (a1-a2, b1-b4, c1, c2, d1, sweep) produced
+# 233 summaries, ALL status=success, in ~8.8 min of workload wall time
+# (clean run; a first run that competed with other CPU-heavy processes
+# took ~19.7 min), 9.4 MB of results on disk, 10 charts + stats
+# parquets. TurboVec C1 scales natively (QPS ~3.3k-4.5k @1 thread ->
+# ~6.3k-7.4k @8 threads, no locked retry); its bit-width sweep spreads
+# recall@10 0.899/0.956/0.973.
+# Measured quirks (turbovec 1.0.0): 3-bit and 4-bit index snapshots are
+# the same size (internal 4-bit packing); only 2-bit compresses (~0.53x
+# of 4-bit).
+# Tip: pass --config configs/impact-benchmark.toml explicitly on every
+# run; the project-local config copy can be removed by external tooling.
+#
+# Metric: COSINE — turbovec's kernel is inner-product-only, so cosine is
+# the single metric under which all five engines are comparable (exact
+# ground truth honors this metric). The dataset's embeddings are NOT
+# unit-norm (norms ~14.9-19.5), so metric-aware ground truth matters.
+#
+# Dataset: not-lain/wikipedia-small-3000-embedded (public, no HF token,
+# 1024-dim embeddings). For ladders > 3k records switch primary to
+# "cohere_wikipedia" (HF auth).
+
+project_name = "benchvec-impact"
+seed = 42
+
+[paths]
+data_dir = ".data"
+benchmark_dir = ".benchmarks"
+cache_dir = ".cache"
+
+[dataset]
+primary = "fast_wikipedia"
+fallback_enabled = true
+seed = 42
+sample_size = 3000
+ground_truth_k = 100
+ground_truth_query_count = 100
+min_text_characters = 64
+chunk_size = 256
+chunk_overlap = 32
+local_embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
+cohere_dataset_name = "Cohere/wikipedia-22-12-simple-embeddings"
+cohere_dataset_config = "en"
+cohere_split = "train"
+simple_wikipedia_name = "wikipedia"
+simple_wikipedia_config = "20220301.simple"
+huggingface_token_env_var = "HF_TOKEN"
+fast_wikipedia_dataset_name = "not-lain/wikipedia-small-3000-embedded"
+fast_wikipedia_split = "train"
+
+[engines]
+enabled = ["faiss", "chromadb", "lancedb", "sqlite_vec", "turbovec"]
+distance_metric = "cosine"
+faiss_index_type = "ivfflat"
+faiss_nlist = 64
+faiss_nprobe = 8
+
+[engines.lancedb]
+index_type = "ivfpq"
+num_partitions = 8
+num_sub_vectors = 16
+nprobes = 8
+refine_factor = 1
+
+[engines.chroma]
+search_ef = 64
+ef_search_grid_enabled = false
+
+[engines.turbovec]
+bit_width = 4
+calibrate = true
+
+[workloads]
+repetitions = 3
+warmup_queries = 10
+# k_values[0] drives the param sweep: k=10 (not 1) gives the TurboQuant
+# bit-width grid genuine recall spread (validated campaign: 2-bit 0.899 /
+# 3-bit 0.956 / 4-bit 0.973 recall@10; at k=1 all widths saturate at 1.0).
+# NOTE: k_values[0] is also the default k for b1-b4, d1, c1 and c2 — the
+# reorder intentionally moves those workloads from k=1 to k=10.
+k_values = [10, 1, 50, 100]
+ingest_batch_sizes = [500]
+ingest_rates_per_second = [100]
+concurrent_workers = [1, 2, 4, 8]
+sample_sizes = [500, 1000, 2000, 3000]
+max_c2_queries = 20000
+
+[workloads.param_sweep]
+faiss_nprobe = [1, 2, 4, 8, 16, 32]
+lancedb_nprobes = [1, 2, 4, 8, 16]
+lancedb_refine_factor = [1]
+turbovec_bit_width = [2, 3, 4]
+max_points = 20000

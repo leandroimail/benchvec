@@ -123,6 +123,42 @@ class Project:
         """Path to charts directory within reports."""
         return self.reports_dir / "charts"
 
+    def find_config(self, config_name: str | None = None) -> Path:
+        """Locate a benchmark configuration file for this project.
+
+        Lookup order:
+        1. ``config_name`` resolved inside the project directory
+        2. ``config_name`` resolved inside the repo-wide ``configs/`` directory
+        3. the project's own ``config.toml`` (written by ``init --template``)
+        4. any TOML/YAML file in the project directory
+        5. any TOML/YAML file in the repo-wide ``configs/`` directory
+
+        Raises:
+            FileNotFoundError: If no candidate file exists.
+        """
+
+        candidates: list[Path] = []
+        if config_name:
+            candidates.append(self.base_path / config_name)
+            candidates.append(Path("configs") / config_name)
+        candidates.append(self.config_path)
+        # project.toml holds project metadata, not a benchmark config.
+        candidates.extend(
+            path
+            for path in sorted(self.base_path.glob("*.toml"))
+            if path != self.project_metadata_path
+        )
+        candidates.extend(sorted(self.base_path.glob("*.yaml")))
+        candidates.extend(sorted(Path("configs").glob("*.toml")))
+        candidates.extend(sorted(Path("configs").glob("*.yaml")))
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        raise FileNotFoundError(
+            f"No configuration file found for project '{self.name}' "
+            f"(looked in {self.base_path} and configs/)"
+        )
+
     def ensure_directories(self) -> None:
         """Create all required project directories if they don't exist.
 
@@ -235,7 +271,8 @@ class Project:
         Args:
             name: Project name (e.g., "my-benchmark").
             template: Template name for initial configuration ("default" or a path).
-                Currently only "default" is supported (creates empty project).
+                "default" creates an empty project; a path to a TOML/YAML file
+                is copied into the project as its config.toml.
 
         Returns:
             Initialized Project instance with directories created.

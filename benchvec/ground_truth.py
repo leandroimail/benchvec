@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Sequence, cast
+from typing import Any, Literal, Sequence, cast
 
 import numpy as np
 import numpy.typing as npt
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field
+
+Metric = Literal["l2", "cosine"]
 
 
 class GroundTruthRow(BaseModel):
@@ -31,6 +33,14 @@ def _as_float32_matrix(vectors: Sequence[Sequence[float]]) -> npt.NDArray[np.flo
     return matrix
 
 
+def _normalize_rows(vectors: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
+    """L2-normalize rows, mapping zero vectors to zero (no NaNs)."""
+
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return vectors / norms
+
+
 def compute_exact_ground_truth(
     base_ids: Sequence[str],
     base_vectors: Sequence[Sequence[float]],
@@ -38,23 +48,42 @@ def compute_exact_ground_truth(
     query_vectors: Sequence[Sequence[float]],
     *,
     k: int,
+    metric: Metric = "l2",
 ) -> list[GroundTruthRow]:
-    """Compute exact L2 nearest neighbors for a query batch."""
+    """Compute exact nearest neighbors for a query batch under a metric.
+
+    ``"l2"`` ranks by squared euclidean distance (historical default,
+    behavior unchanged). ``"cosine"`` L2-normalizes base and query
+    matrices (zero-safe) and ranks by inner product — identical ordering
+    to cosine distance; the reported ``distance`` is cosine distance
+    (``1 - similarity``). Recall numbers are only comparable when the
+    ground-truth metric matches the engines' search metric.
+    """
 
     if k <= 0:
         raise ValueError("k must be positive")
+    if metric not in ("l2", "cosine"):
+        raise ValueError(f"Unsupported ground-truth metric: {metric}")
 
     indexed_base_vectors = _as_float32_matrix(base_vectors)
     indexed_query_vectors = _as_float32_matrix(query_vectors)
     if indexed_base_vectors.shape[1] != indexed_query_vectors.shape[1]:
         raise ValueError("Base and query vectors must share the same dimensionality")
 
+    if metric == "cosine":
+        indexed_base_vectors = _normalize_rows(indexed_base_vectors)
+        indexed_query_vectors = _normalize_rows(indexed_query_vectors)
+
     top_k = min(k, len(base_ids))
     rows: list[GroundTruthRow] = []
     for query_id, query_vector in zip(query_ids, indexed_query_vectors):
-        deltas = indexed_base_vectors - query_vector
-        distances = np.sum(deltas * deltas, axis=1)
-        best_indices = np.argsort(distances)[:top_k]
+        if metric == "cosine":
+            similarities = indexed_base_vectors @ query_vector
+            distances = 1.0 - similarities
+        else:
+            deltas = indexed_base_vectors - query_vector
+            distances = np.sum(deltas * deltas, axis=1)
+        best_indices = np.argsort(distances, kind="stable")[:top_k]
         for rank, index in enumerate(best_indices, start=1):
             rows.append(
                 GroundTruthRow(

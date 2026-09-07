@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, Iterable, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 MetadataValue = str | int | float | bool
 FilterOperator = Literal["eq", "gt", "gte", "lt", "lte"]
@@ -121,10 +121,20 @@ class MetadataFilter:
             "lt": "<",
             "lte": "<=",
         }
+
+        def sql_literal(value: MetadataValue) -> str:
+            if isinstance(value, bool):
+                return "TRUE" if value else "FALSE"
+            if isinstance(value, (int, float)):
+                return repr(value)
+            # Single-quote SQL literals with '' doubling — json.dumps-style
+            # double quotes break the lance SQL parser on special characters.
+            return "'" + str(value).replace("'", "''") + "'"
+
         expressions = []
         for clause in self.clauses:
             expressions.append(
-                f"{clause.field} {operator_map[clause.operator]} {json.dumps(clause.value)}"
+                f"{clause.field} {operator_map[clause.operator]} {sql_literal(clause.value)}"
             )
         return " AND ".join(expressions)
 
@@ -168,6 +178,9 @@ class BenchmarkEngine(ABC):
     distance_metric: DistanceMetric
     index_type: str
     native_filtering: bool
+    # Search parameters actually used by the most recent search call
+    # (populated by adapters; captured into BenchmarkSummary.search_params).
+    last_search_params: dict[str, Any]
 
     @abstractmethod
     def connect(self) -> None:
@@ -205,6 +218,18 @@ class BenchmarkEngine(ABC):
         params: Mapping[str, Any] | None = None,
     ) -> list[SearchHit]:
         """Execute a metadata-filtered vector search."""
+
+    @abstractmethod
+    def delete(self, ids: Sequence[str]) -> int:
+        """Remove records by id.
+
+        Returns the number removed when the backend reports it; best-effort
+        count otherwise (some embedded APIs do not report matches).
+        """
+
+    @abstractmethod
+    def upsert(self, records: Sequence[EngineRecord]) -> None:
+        """Insert records, overwriting any with the same id."""
 
     @abstractmethod
     def persist(self) -> None:

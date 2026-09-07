@@ -20,3 +20,9 @@ __pycache__/
 .sandbox/*
 .tmp/
 .tmp/*
+.benchmarks/
+.cache/
+.data/
+
+# Prepared-dataset cache artifacts (generated at repo root by early runs)
+fast_wikipedia/

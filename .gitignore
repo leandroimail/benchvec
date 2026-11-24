@@ -26,3 +26,5 @@ __pycache__/
 
 # Prepared-dataset cache artifacts (generated at repo root by early runs)
 fast_wikipedia/
+relatorio_cientifico/
+relatorio_deep_search/
